@@ -1,0 +1,97 @@
+diff --git a/AMDRyzenCPUPowerManagement/AMDRyzenCPUPowerManagement.cpp b/AMDRyzenCPUPowerManagement/AMDRyzenCPUPowerManagement.cpp
+index b0fa592..22606fa 100644
+--- a/AMDRyzenCPUPowerManagement/AMDRyzenCPUPowerManagement.cpp
++++ b/AMDRyzenCPUPowerManagement/AMDRyzenCPUPowerManagement.cpp
+@@ -369,6 +369,8 @@ bool AMDRyzenCPUPowerManagement::start(IOService *provider){
+     xnuTSCFreq = *((uint64_t*)pmRyzen_symtable._tscFreq);
+ 
+     pmRyzen_init(this);
++    setProperty("WUJIE-CStateBaseMSR", pmRyzen_cst_base_msr, 64);
++    setProperty("WUJIE-CC6Port", (unsigned long long)pmRyzen_cst_port, 32);
+ 
+     totalNumberOfLogicalCores = pmRyzen_num_logi;
+     totalNumberOfPhysicalCores = pmRyzen_num_phys;
+diff --git a/AMDRyzenCPUPowerManagement/pmAMDRyzen.c b/AMDRyzenCPUPowerManagement/pmAMDRyzen.c
+index 7cd1ae4..16b3419 100644
+--- a/AMDRyzenCPUPowerManagement/pmAMDRyzen.c
++++ b/AMDRyzenCPUPowerManagement/pmAMDRyzen.c
+@@ -6,6 +6,8 @@
+ //
+ 
+ #include "pmAMDRyzen.h"
++#include <sys/sysctl.h>
++#include <pexpert/pexpert.h>
+ 
+ 
+ 
+@@ -18,6 +20,11 @@ uint64_t pmRyzen_tsc_freq;
+ uint64_t pmRyzen_effective_timetsc;
+ 
+ uint32_t pmRyzen_num_phys;
++uint16_t pmRyzen_cst_port = 0;
++/* WUJIE idle mode: 0 = upstream (inw 0xf2), 1 = hlt, 2 = CC6 IO port. Boot-arg ryzenidle=N, live: sysctl debug.ryzenidle */
++int pmRyzen_idle_mode = 0;
++SYSCTL_INT(_debug, OID_AUTO, ryzenidle, CTLFLAG_RW, &pmRyzen_idle_mode, 0, "WUJIE idle: 0 upstream, 1 hlt, 2 cc6");
++uint64_t pmRyzen_cst_base_msr = 0;
+ uint32_t pmRyzen_num_logi;
+ 
+ uint64_t pmRyzen_exit_idle_c;
+@@ -146,6 +153,18 @@ void pmRyzen_PState_reset(){
+ void pmRyzen_init(void *handle){
+     
+     pmRyzen_io_service_handle = handle;
++
++    pmRyzen_cst_base_msr = pmRyzen_rdmsr_safe(handle, 0xC0010073);
++    {
++        uint16_t base = (uint16_t)(pmRyzen_cst_base_msr & 0xFFFF);
++        pmRyzen_cst_port = (base >= 0x100 && base < 0xFFF0) ? (uint16_t)(base + 1) : 0;
++    }
++    {
++        int m;
++        if (PE_parse_boot_argn("ryzenidle", &m, sizeof(m))) pmRyzen_idle_mode = m;
++    }
++    sysctl_register_oid(&sysctl__debug_ryzenidle);
++    IOLog("pmRyzen: CstateBaseAddr MSR=0x%llx, CC6 port=0x%x, idle mode %d\n", pmRyzen_cst_base_msr, pmRyzen_cst_port, pmRyzen_idle_mode);
+     
+     
+     void **kernelDisp = pmRyzen_symtable._pmDispatch;
+@@ -288,10 +307,22 @@ uint64_t pmRyzen_machine_idle(uint64_t maxDur){
+     
+ #elif PMRYZEN_IDLE_IO_CSTATE
+     
+-    __asm__ volatile("sti;"
+-                     "inw $0xf2, %%ax;"
+-                     "cli;"
+-                     :::"%eax");
++    /* WUJIE: mode 2 enters CC6 through the platform C-state IO port (MSR C001_0073 base + 1),
++     * like Linux acpi_idle does on Zen; mode 1 plain HLT; mode 0 upstream. */
++    int mode = pmRyzen_idle_mode;
++    if (mode == 2 && pmRyzen_cst_port) {
++        __asm__ volatile("sti;"
++                         "inb %w0, %%al;"
++                         "cli;"
++                         :: "Nd"(pmRyzen_cst_port) : "%eax");
++    } else if (mode == 1 || mode == 2) {
++        __asm__ volatile("sti;hlt;cli;");
++    } else {
++        __asm__ volatile("sti;"
++                         "inw $0xf2, %%ax;"
++                         "cli;"
++                         :::"%eax");
++    }
+     
+ #endif
+ 
+diff --git a/AMDRyzenCPUPowerManagement/pmAMDRyzen.h b/AMDRyzenCPUPowerManagement/pmAMDRyzen.h
+index 5d4aeae..a1925a1 100644
+--- a/AMDRyzenCPUPowerManagement/pmAMDRyzen.h
++++ b/AMDRyzenCPUPowerManagement/pmAMDRyzen.h
+@@ -87,6 +87,8 @@ typedef struct pmProcessor{
+ } pmProcessor_t;
+ 
+ void pmRyzen_init(void*);
++extern uint16_t pmRyzen_cst_port;
++extern uint64_t pmRyzen_cst_base_msr;
+ void pmRyzen_stop(void);
+ void pmRyzen_PState_reset(void);
+ float pmRyzen_avgload_pcpu(uint32_t);

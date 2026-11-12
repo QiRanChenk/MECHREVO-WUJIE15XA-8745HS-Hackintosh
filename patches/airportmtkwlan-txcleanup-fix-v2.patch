@@ -1,0 +1,90 @@
+diff --git a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+index 8aa07a7..fe42d2f 100644
+--- a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
++++ b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+@@ -1,3 +1,4 @@
++#include <libkern/OSAtomic.h>
+ //
+ //  MtkMwx.cpp
+ //  SimpleMtkWlan
+@@ -465,6 +466,7 @@ struct mwx_queue {
+ 	bus_dmamap_t			mq_map;
+ 	bus_dma_segment_t		mq_seg;
+ 	int				mq_wakeme;
++	volatile UInt32			mq_cleaning;	/* WUJIE: tx_cleanup reentry guard */
+ };
+ 
+ struct mwx_hw_capa {
+@@ -3130,6 +3132,7 @@ mwx_queue_alloc(struct mwx_softc *sc, struct mwx_queue *q, int count,
+ 	    regbase, count, (size_t)size);
+ 	q->mq_regbase = regbase;
+ 	q->mq_count = count;
++	q->mq_cleaning = 0;
+ 
+ 	error = bus_dmamap_create(sc->sc_dmat, size, 1, size, 0,
+ 	    BUS_DMA_NOWAIT, &q->mq_map);
+@@ -3577,23 +3580,50 @@ mwx_dma_txwi_enqueue(struct mwx_softc *sc, struct mwx_queue *q,
+ 	return 0;
+ }
+ 
++static void mwx_dma_tx_cleanup_locked(struct mwx_softc *, struct mwx_queue *);
++
++/*
++ * WUJIE local fix: mwx_intr (tx_done) and mwx_mcu_send_firmware both walk the
++ * same TX ring without mutual exclusion; during firmware download at boot they
++ * race and free the same mbuf twice ("m_free: freeing an already freed mbuf").
++ * Only one walker at a time; a concurrent caller just skips (next pass catches up).
++ */
+ void
+ mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
++{
++	if (!OSCompareAndSwap(0, 1, &q->mq_cleaning))
++		return;
++	mwx_dma_tx_cleanup_locked(sc, q);
++	OSCompareAndSwap(1, 0, &q->mq_cleaning);
++}
++
++static void
++mwx_dma_tx_cleanup_locked(struct mwx_softc *sc, struct mwx_queue *q)
+ {
+ 	struct mwx_queue_data *md;
+ 	struct mwx_desc *desc;
+ 	int idx, last;
+ 
++	int guard = 0;
++
+ 	idx = q->mq_cons;
+ 	last = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX);
+ 
++	/* WUJIE local fix: a stale/unreset chip can report an out-of-range DMA index
++	 * (seen as boot hangs / "m_free: freeing an already freed mbuf" during FW download). */
++	if ((u_int)last >= q->mq_count || (u_int)idx >= q->mq_count) {
++		MWX_DEV_LOG(sc, "tx_cleanup: bad dma idx cons=%d last=0x%x count=%u, skip\n",
++		    idx, last, q->mq_count);
++		return;
++	}
++
+ 	if (idx == last)
+ 		return;
+ 
+ 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
+ 	     BUS_DMASYNC_PREWRITE);
+ 
+-	while (idx != last) {
++	while (idx != last && guard++ < (int)q->mq_count) {
+ 		md = &q->mq_data[idx];
+ 		desc = &q->mq_desc[idx];
+ 
+@@ -3625,8 +3655,11 @@ mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
+ 
+ 		/* check if more data made it in */
+ 		/* XXX should we actually do that? */
+-		if (idx == last)
++		if (idx == last) {
+ 			last = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX);
++			if ((u_int)last >= q->mq_count)
++				last = idx;
++		}
+ 	}
+ 
+ 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
