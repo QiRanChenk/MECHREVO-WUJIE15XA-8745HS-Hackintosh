@@ -16,6 +16,8 @@
 #include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/pci/IOPCIDevice.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <pexpert/pexpert.h>
 #include <sys/sysctl.h>
 
@@ -186,6 +188,24 @@ SYSCTL_INT(_debug, OID_AUTO, wujiexhci_irqs, CTLFLAG_RD, &gIrqs, 0, "");
 SYSCTL_INT(_debug, OID_AUTO, wujiexhci_spurious, CTLFLAG_RD, &gSpurious, 0, "");
 SYSCTL_INT(_debug, OID_AUTO, wujiexhci_storms, CTLFLAG_RD, &gStormReverts, 0, "");
 
+// A system sleep (a hibernation on this machine) power-cycles the controllers and AppleUSBXHCI brings them back with
+// MSI enabled and INTx disabled again, while this kext still believed it was in INTx mode: after a wake the USB mouse
+// answered once every few seconds. Go back to MSI before the sleep; after the wake poll for 3 s like at boot (the
+// timer), then switch to INTx again.
+static int gWakeRestore;
+static IOReturn sleepWake(void *, void *, UInt32 type, IOService *, void *, vm_size_t) {
+    if (!gSelf) return kIOReturnSuccess;
+    if (type == kIOMessageSystemWillSleep) {
+        gWakeRestore = gMode;
+        if (gMode) gSelf->setMode(0);
+    } else if (type == kIOMessageSystemHasPoweredOn && gWakeRestore && gSelf->timer) {
+        gWakeRestore = 0;
+        gStart = mach_absolute_time(); gDelayMs = 3000;
+        gSelf->timer->setTimeoutMS(300);
+    }
+    return kIOReturnSuccess;
+}
+
 bool WujieXhciIntx::start(IOService *provider) {
     if (!IOService::start(provider)) return false;
     gSelf = this;
@@ -199,7 +219,7 @@ bool WujieXhciIntx::start(IOService *provider) {
     // wujiexhci=1: switch 45 s after load (system is up by then); wujiexhci=N (N>1): after N seconds. Until then poll every 2 ms.
     nanoseconds_to_absolutetime(100000000ULL, &gWinTicks);
     gDelayMs = (arg > 1 ? arg : 45) * 1000ULL; gStart = mach_absolute_time();
-    timer = (arg && wl) ? IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
+    timer = wl ? IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
         static int tries;
         WujieXhciIntx *me = static_cast<WujieXhciIntx *>(o);
         me->discover();
@@ -212,7 +232,8 @@ bool WujieXhciIntx::start(IOService *provider) {
         }
         me->setMode(1);
     }) : nullptr;
-    if (timer) { wl->addEventSource(timer); timer->setTimeoutMS(3000); }
+    if (timer) { wl->addEventSource(timer); if (arg) timer->setTimeoutMS(3000); }
+    registerPrioritySleepWakeInterest(&sleepWake, this, nullptr);
     IOLog("WujieXhciIntx loaded (boot-arg %d)\n", arg);
     registerService();
     return true;

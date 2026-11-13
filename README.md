@@ -18,9 +18,9 @@ English summary at the bottom.
 | 键盘 / 亮度键 | PS/2 | ✅ VoodooPS2 + BrightnessKeys（`SSDT-EC-USBX` 中 `_Q14/_Q15` 转发） |
 | 电池 / 电源适配器 | — | ✅ `SSDT-BAT-WUJIE`、`SSDT-AC0-WUJIE` |
 | NVMe | 两块第三方 SSD | ✅ NVMeFix + PCIe ASPM L1 |
-| 摄像头 | UVC | ⚠️ 能拍照，Photo Booth 预览黑屏 |
+| 摄像头 | UVC | ✅ QuickTime / 腾讯会议可用（第三方应用需用 `tools/tcc/tcc-grant.sh` 授权）；Photo Booth 有画面但上下颠倒 |
 | 外接显示器 | HDMI / USB-C | ❌ GPU 驱动暂不支持 |
-| 睡眠 | — | ❌ 固件只有 Modern Standby，无 S3；请禁用睡眠 |
+| 睡眠 | — | ✅ 休眠（S4）：点睡眠/合盖后写镜像断电，按电源键恢复到原桌面（需要本仓库的 WujieSleepPolicy + 修改版 nullarc，见下文）。固件无 S3 |
 | 指纹 | — | ❌ |
 
 空闲功耗：SoC 封装约 7 W，整机熄屏约 14.5 W（GPU 限频 + 时钟门控后）；看视频约 20–30 W。
@@ -31,7 +31,10 @@ English summary at the bottom.
 EFI/                 OpenCore 1.0.8 EFI（BOOT + OC）
 ACPI-src/            本机 SSDT 源码（.dsl）
 patches/             对上游驱动的修改（GPL/BSD 要求公开）
-src/WujieXhciIntx/   AMD xHCI 改用 INTx 中断的 kext 源码（免轮询）
+src/WujieXhciIntx/   AMD xHCI 改用 INTx 中断的 kext 源码（免轮询，睡眠唤醒后自动恢复）
+src/WujieSleepPolicy/ 睡眠策略 kext 源码：一律休眠、绝不进 S3，并把休眠密钥写入 NVRAM
+tools/phxwake/       唤醒后重新初始化核显并恢复显示的常驻服务
+tools/tcc/           关闭 AMFI 后给第三方应用授权摄像头/麦克风的脚本
 tools/gpuclk/        开机给 780M 限频到 800 MHz（省约 25 W），并调用 gpucg
 tools/gpucg/         打开 780M 时钟门控（MGCG/CGCG/CGLS，省约 2 W）
 tools/powerbar/      菜单栏显示充放电功耗、SoC 功耗、温度
@@ -59,7 +62,7 @@ tools/brightkeep/    记住屏幕亮度 + 熄屏时关闭背光
 2. 进系统后按 nullarc INSTALL 安装 GPU 部分，再恢复上述 boot-args。
 3. EFI 可放在 Windows 的 ESP 上，用 `bcdedit` 或 BIOS 添加 `\EFI\OC\OpenCore.efi` 启动项。
 4. 安装 [yt6801-for-macOS](https://github.com/MiniYv/yt6801-for-macOS) 并在系统设置里允许驱动扩展。
-5. `sudo pmset -a disablesleep 1`（无 S3，睡眠后无法唤醒）。
+5. 睡眠：按下文“睡眠（休眠）”一节配置；不配置的话请 `sudo pmset -a disablesleep 1`（无 S3，直接睡眠后无法唤醒）。
 6. 不要直接点系统更新：GPU/网卡驱动与系统版本相关，更新前先备份并确认上游支持。
 
 ### boot-args 说明
@@ -74,12 +77,29 @@ tools/brightkeep/    记住屏幕亮度 + 熄屏时关闭背光
 | `phxkick=0 wujiexhci=1` | 关闭 PhxXhciKick 轮询，改由 WujieXhciIntx 把 AMD xHCI 切到 INTx（加载 45 秒后切换，之前自带 2 ms 轮询；`wujiexhci=N` 指定秒数）。回退：删掉 `wujiexhci=1` 并设 `phxkick=2000` |
 | `keepsyms=1` | panic 报告带符号。不要日常加 `debug=0x100`：panic 后会停在黑屏上全核空转，一小时耗掉大半电池 |
 
+## 睡眠（休眠）
+
+这台机器的固件没有可用的 S3（DSDT 里 `_S3` 被改名成 `XS3`，强行进 S3 无法唤醒），能用的是休眠：写内存镜像、断电，按电源键后恢复到原来的桌面。实测从内核恢复到桌面画面出现约 2 秒。
+
+| 组成 | 作用 |
+|---|---|
+| ACPI 补丁 `XS3_` → `_S3_`（config.plist 已含） | 没有 `_S3` 时 macOS 直接拒绝睡眠（`System sleep prevented by kPMPCIUnsupported`）。S3 本身不会被使用 |
+| `WujieSleepPolicy.kext`（紧跟 Lilu 注入） | 抢在 X86PlatformPlugin 之前注册睡眠策略：休眠模式开着就“休眠”，否则取消睡眠，绝不选 S3；并在自己下电时把休眠密钥 `IOHibernateRTCVariables` 抄进 NVRAM（PC 没有 Mac 的 RTC 存储，否则 boot.efi 报 `EB|H:FAIL` 后复位） |
+| OpenCore `HibernateMode=Auto`、`HibernateSkipsPicker=true` | 把密钥交给 boot.efi，唤醒时不停在启动菜单 |
+| `sudo pmset -a hibernatemode 25 standby 0 autopoweroff 0 powernap 0 disablesleep 0` | 立即休眠 |
+| 修改版 nullarc（[QiRanChenk/nullarc](https://github.com/QiRanChenk/nullarc) `hibernate-resume` 分支的 PhxBringup + PhxAccel） | 睡眠期间挂起 GPU 提交、唤醒后重绑 VMID、放开 IOFramebuffer 的闸门、重新启用加速器 |
+| `tools/phxwake`（`sudo ./install.sh`） | 每次唤醒后重跑 GPU 初始化（约 3 秒）并触发上面两步 |
+
+注意：唤醒需要按电源键；不要带 `-v` / `debug=0x100` 测试休眠（入睡时会卡死）；一次失败的睡眠可能让 MT7922 无线网卡失灵，需彻底断电（关机、拔电源、长按电源键 20 秒）才能恢复。
+
 ## 本仓库的修改
 
 - **AirportMtkWlan**（上游 [Arxusion/AirportMtkWlan](https://github.com/Arxusion/AirportMtkWlan) `fe9db22`，GPL-3.0）：`mwx_dma_tx_cleanup` 中断与固件下载并发重入导致 double free / 开机卡死，加 `OSCompareAndSwap` 重入保护和下标检查。见 `patches/airportmtkwlan-txcleanup-fix-v2.patch`。构建：`AIRPORT_OS=tahoe ./build-macos.sh Release AirportMtkWlan`。
 - **AMDRyzenCPUPowerManagement**（上游 [trulyspinach/SMCAMDProcessor](https://github.com/trulyspinach/SMCAMDProcessor) `029ef3a`，BSD-3）：空闲方式可选（boot-arg `ryzenidle`、运行时 `sysctl debug.ryzenidle`），读取 MSR `C001_0073` 得到 C-state IO 端口。另加 `debug.ryzenidle_port`、特权 user client 选择子 40–45（MSR 读写、xHCI 配置空间/MMIO 读写，调试用）。实测核心空闲合计仅约 0.14 W，CPU 侧已无可省。见 `patches/smcamd-idle-mode.patch`。构建：`xcodebuild -target AMDRyzenCPUPowerManagement -configuration Release MACOSX_DEPLOYMENT_TARGET=12.0 ARCHS=x86_64`。
 - **SSDT**：电池（16 位 EC 字段拆字节）、AC 适配器（`_PSR` 绕过 ALIB）、EC/USBX + 亮度键。
 - **WujieXhciIntx**（原创，MIT）：AppleUSBXHCI 把非等时传输事件放在 interrupter 1，而 AMD 15b9/15ba/15c0/15c1 只有 1 个 MSI 向量且只由 interrupter 0 触发，所以鼠标键盘事件没有中断（PhxXhciKick 用轮询绕过，2 ms 轮询约多耗 0.4 W，8 ms 鼠标发涩）。本 kext 关掉 MSI、启用 INTx，在控制器 work loop 上挂自己的 filter 中断源，清 `USBSTS.EINT`/`IMAN.IP` 后触发 Apple 的中断源；带中断风暴保护（自动退回 MSI）。运行时开关 `sysctl debug.wujiexhci`，计数 `debug.wujiexhci_irqs/_spurious/_storms`。构建：`src/WujieXhciIntx/build.sh <MacKernelSDK>`。
+- **GPU 空闲**：nullarc 没设置 `CP_MEC_DOORBELL_RANGE`，默认范围盖住了图形队列的门铃，第一次敲门铃后 CP 永远报告忙（`GRBM_STATUS 0xa800302c`）。修改版 mesboot 在建队列前写入 Linux 的值（0 / 0x450）。上游 PR #14 有同样的修复。
+- **权限弹窗**：为 nullarc 关闭 AMFI 后，tccd 对第三方应用不弹授权窗（日志 `Policy disallows prompt`），用 `tools/tcc/tcc-grant.sh /Applications/XXX.app` 直接写入摄像头/麦克风授权。
 - **GPU 时钟门控**：nullarc 让 `RLC_CGTT_MGCG_OVERRIDE` 保持复位值、CGCG/CGLS 关闭。`tools/gpucg/gpucg.sh all` 按 Linux `gfx_v11_0_update_gfx_clock_gating()` 的顺序打开，SoC 封装空闲 8.8 W → 约 6.8 W，桌面和视频无可见影响。`touch /Users/Shared/gpu/gpucg-off` 可跳过。
 - **GPU 限频**：nullarc 让 GFX 时钟固定 2600 MHz；通过 SMU `SetSoftMaxGfxClk(800)` 空闲功耗从约 50 W 降到约 20 W，桌面与视频无可见影响。
 
@@ -95,7 +115,7 @@ tools/brightkeep/    记住屏幕亮度 + 熄屏时关闭背光
 
 OpenCore 1.0.8 EFI for the MECHREVO WUJIE15XA (Ryzen 7 8745HS, Radeon 780M) running macOS 26 Tahoe.
 Works: 780M Metal acceleration via nullarc (internal panel only), MT7922 Wi-Fi/BT, YT6801 Ethernet (DEXT, `dk=0x8001`), audio, trackpad, battery/AC, brightness keys, NVMe power management.
-Not working: sleep (no S3 in firmware), external displays, fingerprint.
+Sleep works as hibernation (S4): `WujieSleepPolicy.kext`, the ACPI `XS3`->`_S3` patch, OpenCore `HibernateMode=Auto`, the patched nullarc kexts from the `hibernate-resume` branch of QiRanChenk/nullarc and `tools/phxwake`; see the Chinese section above. Not working: S3, external displays, fingerprint.
 `PhxBringup.kext`, `AMFIPass.kext` and `SimpleHDA.kext` are not redistributed — download them from upstream (links above).
 SMBIOS fields are blank: generate your own for `MacBookPro16,1`.
 Source patches for the modified GPL/BSD kexts are in `patches/`.
