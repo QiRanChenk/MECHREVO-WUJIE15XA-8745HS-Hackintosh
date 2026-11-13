@@ -51,7 +51,7 @@ final class App: NSObject, NSApplicationDelegate {
         item.menu = menu
         item.button?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         tick()
-        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in self.tick() }
+        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in self.tick() }
     }
 
     func tick() {
