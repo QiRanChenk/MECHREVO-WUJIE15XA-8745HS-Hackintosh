@@ -24,9 +24,9 @@ struct Ctl {
     IOService *ctrl; IOPCIDevice *pci; IOWorkLoop *wl; IOMemoryMap *map; volatile uint8_t *base;
     uint32_t op, rt, nintr; uint8_t msiOff;
     IOFilterInterruptEventSource *appleES, *myES;
-    bool intx, dead; uint32_t irqs, spurious, winIrqs; uint64_t winStart;
+    bool intx, dead, stop; uint32_t irqs, spurious, winIrqs; uint64_t winStart;
 };
-static uint64_t gStart, gDelayMs;
+static uint64_t gStart, gDelayMs, gWinTicks;
 static Ctl gC[MAXC]; static int gN; static int gMode; static int gIrqs, gSpurious, gStormReverts;
 
 struct ESPeek : IOEventSource { static IOEventSource *next(IOEventSource *e) { return static_cast<ESPeek *>(e)->getNext(); } };
@@ -53,14 +53,25 @@ static WujieXhciIntx *gSelf;
 
 static Ctl *byES(void *es) { for (int i = 0; i < gN; i++) if (gC[i].myES == es) return &gC[i]; return nullptr; }
 
+// Primary interrupt context. Run Apple's own interrupt path first, with IMAN.IP still set, exactly as an MSI on that
+// interrupter would (v1-v3 cleared IP and only signalled the action: interrupter 1 worked, the isochronous ring on
+// interrupter 2 was never drained and the camera delivered no frames). Then drop the level line ourselves: under MSI
+// the controller clears IP by itself, so Apple's code may not.
 bool WujieXhciIntx::filter(OSObject *, IOFilterInterruptEventSource *src) {
     Ctl *c = byES(src);
     if (!c || !c->intx) return false;
     bool pend = rd(c, c->op + 4) & 0x8;                       // USBSTS.EINT
     for (uint32_t i = 0; !pend && i < c->nintr; i++) pend = rd(c, iman(c, i)) & 1;
     if (!pend) { c->spurious++; gSpurious++; return false; }
-    c->irqs++; c->winIrqs++; gIrqs++;
-    return true;                                              // level source: masked until action() has run
+    c->irqs++; gIrqs++;
+    uint64_t now = mach_absolute_time();
+    if (now - c->winStart > gWinTicks) { c->winStart = now; c->winIrqs = 0; }
+    bool alive = c->appleES && c->appleES->getWorkLoop() == c->wl && !c->ctrl->isInactive();
+    if (!alive || ++c->winIrqs > 5000) { c->stop = true; return true; }   // level source: masked until action() detaches
+    c->appleES->normalInterruptOccurred(nullptr, c->pci, 0);
+    wr(c, c->op + 4, 0x8);                                    // USBSTS.EINT is RW1C
+    for (uint32_t i = 0; i < c->nintr; i++) { uint32_t v = rd(c, iman(c, i)); if (v & 1) wr(c, iman(c, i), v); }  // IMAN.IP RW1C, IE kept
+    return false;
 }
 
 static void toMsi(Ctl *c) {
@@ -69,22 +80,15 @@ static void toMsi(Ctl *c) {
     c->intx = false;
 }
 
+// Work loop context, only reached when filter() gave up: >50k interrupts/s (stuck pin) or Apple's source is gone
+// (it leaves the work loop when the controller stops at shutdown; signalling it then is a NULL dereference).
 void WujieXhciIntx::action(OSObject *, IOInterruptEventSource *src, int) {
     Ctl *c = byES(src);
-    if (!c) return;
-    uint64_t now = mach_absolute_time(), ns = 0;
-    absolutetime_to_nanoseconds(now - c->winStart, &ns);
-    if (ns > 100000000ULL) { c->winStart = now; c->winIrqs = 0; }
-    else if (c->winIrqs > 5000) {                             // >50k/s: the pin is stuck, give up on this controller
-        toMsi(c); src->disable(); gStormReverts++;
-        IOLog("WujieXhciIntx: interrupt storm on %s, back to MSI\n", c->pci->getName());
-        return;
-    }
-    wr(c, c->op + 4, 0x8);                                    // USBSTS.EINT is RW1C
-    for (uint32_t i = 0; i < c->nintr; i++) { uint32_t v = rd(c, iman(c, i)); if (v & 1) wr(c, iman(c, i), v); }  // IMAN.IP RW1C, IE kept
-    // Apple removes its source from the work loop when the controller stops (shutdown/restart); signalling it then is a NULL deref.
-    if (c->appleES && c->appleES->getWorkLoop() == c->wl && !c->ctrl->isInactive()) { c->appleES->signalInterrupt(); return; }
+    if (!c || !c->stop) return;
+    c->stop = false;
+    bool alive = c->appleES && c->appleES->getWorkLoop() == c->wl && !c->ctrl->isInactive();
     toMsi(c); src->disable();
+    if (alive) { gStormReverts++; IOLog("WujieXhciIntx: interrupt storm on %s, back to MSI\n", c->pci->getName()); c->appleES->signalInterrupt(); return; }
     if (c->appleES) { c->appleES->release(); c->appleES = nullptr; }
     c->dead = true;
     IOLog("WujieXhciIntx: %s: controller stopped, detached\n", c->pci->getName());
@@ -193,6 +197,7 @@ bool WujieXhciIntx::start(IOService *provider) {
     PE_parse_boot_argn("wujiexhci", &arg, sizeof(arg));
     IOWorkLoop *wl = getWorkLoop();
     // wujiexhci=1: switch 45 s after load (system is up by then); wujiexhci=N (N>1): after N seconds. Until then poll every 2 ms.
+    nanoseconds_to_absolutetime(100000000ULL, &gWinTicks);
     gDelayMs = (arg > 1 ? arg : 45) * 1000ULL; gStart = mach_absolute_time();
     timer = (arg && wl) ? IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
         static int tries;
