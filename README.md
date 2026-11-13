@@ -23,7 +23,7 @@ English summary at the bottom.
 | 睡眠 | — | ❌ 固件只有 Modern Standby，无 S3；请禁用睡眠 |
 | 指纹 | — | ❌ |
 
-空闲整机功耗约 19 W（GPU 限频后），看视频约 20–30 W。
+空闲功耗：SoC 封装约 7 W，整机熄屏约 14.5 W（GPU 限频 + 时钟门控后）；看视频约 20–30 W。
 
 ## 目录
 
@@ -31,7 +31,11 @@ English summary at the bottom.
 EFI/                 OpenCore 1.0.8 EFI（BOOT + OC）
 ACPI-src/            本机 SSDT 源码（.dsl）
 patches/             对上游驱动的修改（GPL/BSD 要求公开）
-tools/gpuclk/        开机给 780M 限频到 800 MHz（省约 25 W）
+src/WujieXhciIntx/   AMD xHCI 改用 INTx 中断的 kext 源码（免轮询）
+tools/gpuclk/        开机给 780M 限频到 800 MHz（省约 25 W），并调用 gpucg
+tools/gpucg/         打开 780M 时钟门控（MGCG/CGCG/CGLS，省约 2 W）
+tools/powerbar/      菜单栏显示充放电功耗、SoC 功耗、温度
+tools/ryzenstat/     读 MSR / 每核功耗的小工具（需本仓库补丁版 CPU kext）
 tools/brightkeep/    记住屏幕亮度 + 熄屏时关闭背光
 ```
 
@@ -67,13 +71,16 @@ tools/brightkeep/    记住屏幕亮度 + 熄屏时关闭背光
 | `alcid=21` | SN6140 声卡布局 |
 | `ryzenidle=1` | 本仓库补丁版 AMDRyzenCPUPowerManagement：空闲用 `hlt`（0=上游，2=CC6，CC6 会导致画面不刷新且更耗电） |
 | `dk=0x8001` | 允许 YT6801 DEXT 绑定被 ACPI 标记为 built-in 的网卡 |
-| `keepsyms=1 debug=0x100` | 调试：panic 停在屏幕上，日常可删 |
+| `phxkick=0 wujiexhci=1` | 关闭 PhxXhciKick 轮询，改由 WujieXhciIntx 把 AMD xHCI 切到 INTx（加载 45 秒后切换，之前自带 2 ms 轮询；`wujiexhci=N` 指定秒数）。回退：删掉 `wujiexhci=1` 并设 `phxkick=2000` |
+| `keepsyms=1` | panic 报告带符号。不要日常加 `debug=0x100`：panic 后会停在黑屏上全核空转，一小时耗掉大半电池 |
 
 ## 本仓库的修改
 
 - **AirportMtkWlan**（上游 [Arxusion/AirportMtkWlan](https://github.com/Arxusion/AirportMtkWlan) `fe9db22`，GPL-3.0）：`mwx_dma_tx_cleanup` 中断与固件下载并发重入导致 double free / 开机卡死，加 `OSCompareAndSwap` 重入保护和下标检查。见 `patches/airportmtkwlan-txcleanup-fix-v2.patch`。构建：`AIRPORT_OS=tahoe ./build-macos.sh Release AirportMtkWlan`。
-- **AMDRyzenCPUPowerManagement**（上游 [trulyspinach/SMCAMDProcessor](https://github.com/trulyspinach/SMCAMDProcessor) `029ef3a`，BSD-3）：空闲方式可选（boot-arg `ryzenidle`、运行时 `sysctl debug.ryzenidle`），读取 MSR `C001_0073` 得到 C-state IO 端口。见 `patches/smcamd-idle-mode.patch`。构建：`xcodebuild -target AMDRyzenCPUPowerManagement -configuration Release MACOSX_DEPLOYMENT_TARGET=12.0 ARCHS=x86_64`。
+- **AMDRyzenCPUPowerManagement**（上游 [trulyspinach/SMCAMDProcessor](https://github.com/trulyspinach/SMCAMDProcessor) `029ef3a`，BSD-3）：空闲方式可选（boot-arg `ryzenidle`、运行时 `sysctl debug.ryzenidle`），读取 MSR `C001_0073` 得到 C-state IO 端口。另加 `debug.ryzenidle_port`、特权 user client 选择子 40–45（MSR 读写、xHCI 配置空间/MMIO 读写，调试用）。实测核心空闲合计仅约 0.14 W，CPU 侧已无可省。见 `patches/smcamd-idle-mode.patch`。构建：`xcodebuild -target AMDRyzenCPUPowerManagement -configuration Release MACOSX_DEPLOYMENT_TARGET=12.0 ARCHS=x86_64`。
 - **SSDT**：电池（16 位 EC 字段拆字节）、AC 适配器（`_PSR` 绕过 ALIB）、EC/USBX + 亮度键。
+- **WujieXhciIntx**（原创，MIT）：AppleUSBXHCI 把非等时传输事件放在 interrupter 1，而 AMD 15b9/15ba/15c0/15c1 只有 1 个 MSI 向量且只由 interrupter 0 触发，所以鼠标键盘事件没有中断（PhxXhciKick 用轮询绕过，2 ms 轮询约多耗 0.4 W，8 ms 鼠标发涩）。本 kext 关掉 MSI、启用 INTx，在控制器 work loop 上挂自己的 filter 中断源，清 `USBSTS.EINT`/`IMAN.IP` 后触发 Apple 的中断源；带中断风暴保护（自动退回 MSI）。运行时开关 `sysctl debug.wujiexhci`，计数 `debug.wujiexhci_irqs/_spurious/_storms`。构建：`src/WujieXhciIntx/build.sh <MacKernelSDK>`。
+- **GPU 时钟门控**：nullarc 让 `RLC_CGTT_MGCG_OVERRIDE` 保持复位值、CGCG/CGLS 关闭。`tools/gpucg/gpucg.sh all` 按 Linux `gfx_v11_0_update_gfx_clock_gating()` 的顺序打开，SoC 封装空闲 8.8 W → 约 6.8 W，桌面和视频无可见影响。`touch /Users/Shared/gpu/gpucg-off` 可跳过。
 - **GPU 限频**：nullarc 让 GFX 时钟固定 2600 MHz；通过 SMU `SetSoftMaxGfxClk(800)` 空闲功耗从约 50 W 降到约 20 W，桌面与视频无可见影响。
 
 ## 致谢
@@ -92,3 +99,5 @@ Not working: sleep (no S3 in firmware), external displays, fingerprint.
 `PhxBringup.kext`, `AMFIPass.kext` and `SimpleHDA.kext` are not redistributed — download them from upstream (links above).
 SMBIOS fields are blank: generate your own for `MacBookPro16,1`.
 Source patches for the modified GPL/BSD kexts are in `patches/`.
+`WujieXhciIntx.kext` (source in `src/`) switches the AMD xHCI controllers from MSI to legacy INTx so HID events raise interrupts without polling (`phxkick=0 wujiexhci=1`).
+`tools/gpucg` enables 780M clock gating (about 2 W less at idle). Do not keep `debug=0x100` for daily use: a panic then halts with all cores spinning and drains the battery.

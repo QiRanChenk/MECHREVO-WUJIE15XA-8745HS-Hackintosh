@@ -8,3 +8,7 @@ ioreg -rc NMXAccel -d0 | grep -q NMXAccel || { echo "no NMXAccel"; exit 0; }
 sleep 15
 /Users/Shared/gpu/phxctl/phxctl smu 0x1b 800 | tail -1
 /Users/Shared/gpu/phxctl/phxctl smu 0x17 0 | tail -1
+# Enable GFX clock gating (nullarc leaves every override set; ~2 W idle). Skip with /Users/Shared/gpu/gpucg-off.
+if [ -x /usr/local/libexec/gpucg.sh ] && [ ! -e /Users/Shared/gpu/gpucg-off ]; then
+  /usr/local/libexec/gpucg.sh all
+fi

@@ -1,3 +1,141 @@
+diff --git a/AMDRyzenCPUPowerManagement/AMDRyzenCPUPMUserClient.cpp b/AMDRyzenCPUPowerManagement/AMDRyzenCPUPMUserClient.cpp
+index e4339ee..8bbfd0b 100644
+--- a/AMDRyzenCPUPowerManagement/AMDRyzenCPUPMUserClient.cpp
++++ b/AMDRyzenCPUPowerManagement/AMDRyzenCPUPMUserClient.cpp
+@@ -89,6 +89,25 @@ bool AMDRyzenCPUPMUserClient::hasPrivilege(){
+     return false;
+ }
+ 
++// WUJIE: n-th AMD xHCI controller (class 0x0c0330, vendor 0x1022). Caller releases.
++static IOPCIDevice *wujieXhci(uint32_t idx){
++    OSDictionary *m = IOService::serviceMatching("IOPCIDevice");
++    if(!m) return nullptr;
++    OSIterator *it = IOService::getMatchingServices(m);
++    m->release();
++    if(!it) return nullptr;
++    IOPCIDevice *found = nullptr; uint32_t n = 0;
++    while(OSObject *o = it->getNextObject()){
++        IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o);
++        if(!d) continue;
++        if(d->configRead16(kIOPCIConfigVendorID) != 0x1022) continue;
++        if((d->configRead32(kIOPCIConfigRevisionID) >> 8) != 0x0c0330) continue;
++        if(n++ == idx){ found = d; found->retain(); break; }
++    }
++    it->release();
++    return found;
++}
++
+ IOReturn AMDRyzenCPUPMUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
+                                                  IOExternalMethodDispatch *dispatch,
+                                                    OSObject *target, void *reference){
+@@ -395,6 +414,93 @@ IOReturn AMDRyzenCPUPMUserClient::externalMethod(uint32_t selector, IOExternalMe
+             break;
+         }
+         
++        //WUJIE: read MSR on the calling CPU. in: addr. out: value
++        case 40: {
++            if(!hasPrivilege())
++                return kIOReturnNotPrivileged;
++            if(arguments->scalarInputCount != 1)
++                return kIOReturnBadArgument;
++            uint64_t v = 0;
++            if(!fProvider->read_msr((uint32_t)arguments->scalarInput[0], &v))
++                return kIOReturnIOError;
++            arguments->scalarOutputCount = 1;
++            arguments->scalarOutput[0] = v;
++            break;
++        }
++
++        //WUJIE: write MSR on every CPU. in: addr, value
++        case 41: {
++            if(!hasPrivilege())
++                return kIOReturnNotPrivileged;
++            if(arguments->scalarInputCount != 2)
++                return kIOReturnBadArgument;
++            wujieMsrAddr = (uint32_t)arguments->scalarInput[0];
++            wujieMsrValue = arguments->scalarInput[1];
++            mp_rendezvous_no_intrs([](void *obj) {
++                auto c = static_cast<AMDRyzenCPUPMUserClient*>(obj);
++                c->fProvider->write_msr(c->wujieMsrAddr, c->wujieMsrValue);
++            }, this);
++            break;
++        }
++
++        //WUJIE: read one MSR on every CPU. in: addr. out struct: uint64 per logical CPU
++        case 42: {
++            if(!hasPrivilege())
++                return kIOReturnNotPrivileged;
++            if(arguments->scalarInputCount != 1)
++                return kIOReturnBadArgument;
++            uint32_t n = fProvider->totalNumberOfLogicalCores;
++            if(n > 64 || arguments->structureOutputSize < n * sizeof(uint64_t))
++                return kIOReturnBadArgument;
++            wujieMsrAddr = (uint32_t)arguments->scalarInput[0];
++            for(uint32_t k = 0; k < 64; k++) wujieMsrAll[k] = 0;
++            mp_rendezvous_no_intrs([](void *obj) {
++                auto c = static_cast<AMDRyzenCPUPMUserClient*>(obj);
++                uint32_t cn = cpu_number();
++                uint64_t v = 0;
++                if(cn < 64 && c->fProvider->read_msr(c->wujieMsrAddr, &v)) c->wujieMsrAll[cn] = v;
++            }, this);
++            uint64_t *out = (uint64_t*)arguments->structureOutput;
++            for(uint32_t k = 0; k < n; k++) out[k] = wujieMsrAll[k];
++            arguments->structureOutputSize = n * sizeof(uint64_t);
++            arguments->scalarOutputCount = 1;
++            arguments->scalarOutput[0] = n;
++            break;
++        }
++
++        //WUJIE xHCI debug. 43: in idx, cfg offset -> out dword, bdf. 44: in idx, BAR reg, offset -> out dword.
++        //45: in idx, BAR reg, offset, value (MMIO write)
++        case 43: case 44: case 45: {
++            if(!hasPrivilege())
++                return kIOReturnNotPrivileged;
++            uint32_t need = selector == 43 ? 2 : (selector == 44 ? 3 : 4);
++            if(arguments->scalarInputCount != need)
++                return kIOReturnBadArgument;
++            IOPCIDevice *d = wujieXhci((uint32_t)arguments->scalarInput[0]);
++            if(!d) return kIOReturnNoDevice;
++            IOReturn r = kIOReturnSuccess;
++            if(selector == 43){
++                arguments->scalarOutput[0] = d->extendedConfigRead32((IOByteCount)arguments->scalarInput[1]);
++                arguments->scalarOutput[1] = (d->getBusNumber() << 16) | (d->getDeviceNumber() << 8) | d->getFunctionNumber();
++                arguments->scalarOutputCount = 2;
++            } else {
++                IOMemoryMap *map = d->mapDeviceMemoryWithRegister((UInt8)arguments->scalarInput[1]);
++                uint64_t off = arguments->scalarInput[2];
++                if(!map) r = kIOReturnNoMemory;
++                else if(off + 4 > map->getLength() || (off & 3)) r = kIOReturnBadArgument;
++                else {
++                    volatile uint32_t *p = (volatile uint32_t *)(map->getVirtualAddress() + off);
++                    if(selector == 45) *p = (uint32_t)arguments->scalarInput[3];
++                    arguments->scalarOutput[0] = *p;
++                    arguments->scalarOutputCount = 1;
++                }
++                if(map) map->release();
++            }
++            d->release();
++            if(r != kIOReturnSuccess) return r;
++            break;
++        }
++
+         //Get LPM
+         case 18: {
+             arguments->scalarOutputCount = 0;
+diff --git a/AMDRyzenCPUPowerManagement/AMDRyzenCPUPMUserClient.hpp b/AMDRyzenCPUPowerManagement/AMDRyzenCPUPMUserClient.hpp
+index 985afe7..6af2ca6 100644
+--- a/AMDRyzenCPUPowerManagement/AMDRyzenCPUPMUserClient.hpp
++++ b/AMDRyzenCPUPowerManagement/AMDRyzenCPUPMUserClient.hpp
+@@ -46,6 +46,9 @@ protected:
+     
+     AMDRyzenCPUPowerManagement *fProvider;
+     void *token;
++    uint32_t wujieMsrAddr;
++    uint64_t wujieMsrValue;
++    uint64_t wujieMsrAll[64];
+     bool clientAuthorizedByUser = false;
+     
+     bool hasPrivilege();
 diff --git a/AMDRyzenCPUPowerManagement/AMDRyzenCPUPowerManagement.cpp b/AMDRyzenCPUPowerManagement/AMDRyzenCPUPowerManagement.cpp
 index b0fa592..22606fa 100644
 --- a/AMDRyzenCPUPowerManagement/AMDRyzenCPUPowerManagement.cpp
@@ -12,7 +150,7 @@ index b0fa592..22606fa 100644
      totalNumberOfLogicalCores = pmRyzen_num_logi;
      totalNumberOfPhysicalCores = pmRyzen_num_phys;
 diff --git a/AMDRyzenCPUPowerManagement/pmAMDRyzen.c b/AMDRyzenCPUPowerManagement/pmAMDRyzen.c
-index 7cd1ae4..16b3419 100644
+index 7cd1ae4..3c0aca3 100644
 --- a/AMDRyzenCPUPowerManagement/pmAMDRyzen.c
 +++ b/AMDRyzenCPUPowerManagement/pmAMDRyzen.c
 @@ -6,6 +6,8 @@
@@ -24,7 +162,7 @@ index 7cd1ae4..16b3419 100644
  
  
  
-@@ -18,6 +20,11 @@ uint64_t pmRyzen_tsc_freq;
+@@ -18,6 +20,17 @@ uint64_t pmRyzen_tsc_freq;
  uint64_t pmRyzen_effective_timetsc;
  
  uint32_t pmRyzen_num_phys;
@@ -33,10 +171,16 @@ index 7cd1ae4..16b3419 100644
 +int pmRyzen_idle_mode = 0;
 +SYSCTL_INT(_debug, OID_AUTO, ryzenidle, CTLFLAG_RW, &pmRyzen_idle_mode, 0, "WUJIE idle: 0 upstream, 1 hlt, 2 cc6");
 +uint64_t pmRyzen_cst_base_msr = 0;
++/* WUJIE: IO port read in idle mode 2. The kext itself moves CstateBaseAddr to 0xf0, so the
++ * three C-state request ports are 0xf0 (CCR0), 0xf1 (CCR1), 0xf2 (CCR2). */
++int pmRyzen_idle_port = 0xf1;
++SYSCTL_INT(_debug, OID_AUTO, ryzenidle_port, CTLFLAG_RW, &pmRyzen_idle_port, 0, "WUJIE idle mode 2 IO port");
++uint64_t pmRyzen_idle_count = 0;
++SYSCTL_QUAD(_debug, OID_AUTO, ryzenidle_count, CTLFLAG_RD, &pmRyzen_idle_count, "WUJIE idle entries");
  uint32_t pmRyzen_num_logi;
  
  uint64_t pmRyzen_exit_idle_c;
-@@ -146,6 +153,18 @@ void pmRyzen_PState_reset(){
+@@ -146,6 +159,20 @@ void pmRyzen_PState_reset(){
  void pmRyzen_init(void *handle){
      
      pmRyzen_io_service_handle = handle;
@@ -51,11 +195,13 @@ index 7cd1ae4..16b3419 100644
 +        if (PE_parse_boot_argn("ryzenidle", &m, sizeof(m))) pmRyzen_idle_mode = m;
 +    }
 +    sysctl_register_oid(&sysctl__debug_ryzenidle);
++    sysctl_register_oid(&sysctl__debug_ryzenidle_port);
++    sysctl_register_oid(&sysctl__debug_ryzenidle_count);
 +    IOLog("pmRyzen: CstateBaseAddr MSR=0x%llx, CC6 port=0x%x, idle mode %d\n", pmRyzen_cst_base_msr, pmRyzen_cst_port, pmRyzen_idle_mode);
      
      
      void **kernelDisp = pmRyzen_symtable._pmDispatch;
-@@ -288,10 +307,22 @@ uint64_t pmRyzen_machine_idle(uint64_t maxDur){
+@@ -288,10 +315,24 @@ uint64_t pmRyzen_machine_idle(uint64_t maxDur){
      
  #elif PMRYZEN_IDLE_IO_CSTATE
      
@@ -66,11 +212,13 @@ index 7cd1ae4..16b3419 100644
 +    /* WUJIE: mode 2 enters CC6 through the platform C-state IO port (MSR C001_0073 base + 1),
 +     * like Linux acpi_idle does on Zen; mode 1 plain HLT; mode 0 upstream. */
 +    int mode = pmRyzen_idle_mode;
-+    if (mode == 2 && pmRyzen_cst_port) {
++    uint16_t port = (uint16_t)pmRyzen_idle_port;
++    pmRyzen_idle_count++;
++    if (mode == 2 && port >= 0xf0 && port <= 0xf7) {
 +        __asm__ volatile("sti;"
-+                         "inb %w0, %%al;"
++                         "inb %%dx, %%al;"
 +                         "cli;"
-+                         :: "Nd"(pmRyzen_cst_port) : "%eax");
++                         :: "d"(port) : "%eax");
 +    } else if (mode == 1 || mode == 2) {
 +        __asm__ volatile("sti;hlt;cli;");
 +    } else {
