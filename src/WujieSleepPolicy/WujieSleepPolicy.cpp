@@ -84,29 +84,34 @@ static void copyKey(void) {
 // longer raises its queries, so closing the lid (_Q19) does nothing and the brightness keys (_Q11/_Q12) are dead, while
 // keys the keyboard controller reports itself (volume, keyboard backlight) still work. The firmware tells the EC which
 // OS runs in EC0._REG (XSEC = OSEC) and again in _WAK, but there only for Arg0 == 4, which macOS does not pass on this
-// path. Running EC0._REG(3, 1) again after every wake puts the EC back into ACPI mode.
+// path. Running the EC's _REG(3, 1) again after every wake puts the EC back into ACPI mode.
 static int gEcReg = 0, gEcRegLast = -1;
 SYSCTL_INT(_debug, OID_AUTO, wujiesleep_ecreg, CTLFLAG_RD, &gEcReg, 0, "EC0._REG evaluations after a wake");
 SYSCTL_INT(_debug, OID_AUTO, wujiesleep_ecreg_last, CTLFLAG_RD, &gEcRegLast, 0, "result of the last one (0 = ok)");
 static void ecRegister(thread_call_param_t, thread_call_param_t) {
-    static const char *const paths[] = { "IOACPIPlane:/_SB/PCI0/SBRG/EC0", "IOACPIPlane:/_SB/PCI0/LPCB/EC0", "IOACPIPlane:/_SB/PCI0/LPC0/EC0" };
-    for (const char *path : paths) {
-        IORegistryEntry *e = IORegistryEntry::fromPath(path);
-        if (!e) continue;
-        if (e->metaCast("IOACPIPlatformDevice")) {
-            IOACPIPlatformDevice *ec = static_cast<IOACPIPlatformDevice *>(e);
-            OSObject *args[2] = { OSNumber::withNumber(3ull, 32), OSNumber::withNumber(1ull, 32) };   // EmbeddedControl, connect
-            gEcRegLast = (args[0] && args[1]) ? ec->evaluateObject("_REG", nullptr, args, 2) : -2;
-            if (args[0]) args[0]->release();
-            if (args[1]) args[1]->release();
-            gEcReg++;
-            IOLog("WujieSleepPolicy: %s._REG(3, 1) after wake -> 0x%x\n", path, gEcRegLast);
-        }
-        e->release();
-        return;
-    }
-    IOLog("WujieSleepPolicy: no EC0 found, nothing re-registered\n");
+    // the EC by its _HID, as AppleACPIEC finds it
+    OSDictionary *m = IOService::nameMatching("PNP0C09");
+    IOService *svc = m ? IOService::copyMatchingService(m) : nullptr;
+    if (m) m->release();
+    if (svc && svc->metaCast("IOACPIPlatformDevice")) {
+        IOACPIPlatformDevice *ec = static_cast<IOACPIPlatformDevice *>(svc);
+        OSObject *args[2] = { OSNumber::withNumber(3ull, 32), OSNumber::withNumber(1ull, 32) };   // EmbeddedControl, connect
+        gEcRegLast = (args[0] && args[1]) ? ec->evaluateObject("_REG", nullptr, args, 2) : -2;
+        if (args[0]) args[0]->release();
+        if (args[1]) args[1]->release();
+        gEcReg++;
+        IOLog("WujieSleepPolicy: %s._REG(3, 1) -> 0x%x\n", ec->getName(), gEcRegLast);
+    } else IOLog("WujieSleepPolicy: no embedded controller (PNP0C09) found, nothing re-registered\n");
+    if (svc) svc->release();
 }
+// debug.wujiesleep_ecreg_now: write 1 to run it by hand
+static int ecRegNow(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+    int v = 0; int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    if (v == 1) ecRegister(nullptr, nullptr);
+    return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, wujiesleep_ecreg_now, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, ecRegNow, "I", "write 1: evaluate the EC's _REG(3, 1) now");
 static thread_call_t gEcCall;
 
 class WujieSleepPolicy : public IOService {
@@ -129,7 +134,7 @@ bool WujieSleepPolicy::start(IOService *provider) {
     gInstalled = r == kIOReturnSuccess ? 1 : -1;
     IOLog("WujieSleepPolicy: install -> 0x%x (%s)\n", r, r == kIOReturnSuccess ? "ours" : "another handler was first");
     sysctl_register_oid(&sysctl__debug_wujiesleep_key_writes);
-    sysctl_register_oid(&sysctl__debug_wujiesleep_ecreg); sysctl_register_oid(&sysctl__debug_wujiesleep_ecreg_last);
+    sysctl_register_oid(&sysctl__debug_wujiesleep_ecreg); sysctl_register_oid(&sysctl__debug_wujiesleep_ecreg_last); sysctl_register_oid(&sysctl__debug_wujiesleep_ecreg_now);
     gEcCall = thread_call_allocate(ecRegister, nullptr);
     static IOPMPowerState states[2] = {
         { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
