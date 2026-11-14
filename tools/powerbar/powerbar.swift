@@ -59,6 +59,7 @@ final class App: NSObject, NSApplicationDelegate {
     let detail = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let cpuLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let timeLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    var lastWatts: Double = 0
     var battAvg: Double? = nil      // battery watts averaged over about a minute: the estimate should not jump
     var pendingWrite: Timer? = nil
     var pendingMode: String? = nil  // chosen but not yet reported back by the service
@@ -154,7 +155,10 @@ final class App: NSObject, NSApplicationDelegate {
 
     func tick() {
         var title = "—"
-        if let b = batteryInfo() {
+        if var b = batteryInfo() {
+            // the gauge reports nonsense for a sample or two when the adapter is plugged or unplugged (-435 W seen):
+            // nothing here moves more than 150 W, so such a sample keeps the previous reading
+            if abs(b.watts) > 150 { b.watts = lastWatts } else { lastWatts = b.watts }
             let w = b.watts
             if abs(w) < 0.05 { title = b.external ? "⚡︎0W" : "0W" }
             else if w > 0 { title = String(format: "⚡︎+%.1fW", w) }

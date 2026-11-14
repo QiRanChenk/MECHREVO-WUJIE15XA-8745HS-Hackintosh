@@ -13,6 +13,7 @@
 #include <sys/sysctl.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <kern/thread_call.h>
+#include <pexpert/pexpert.h>
 
 struct PolicyVars {            // IOPMSystemSleepPolicyVariables (xnu IOPMPrivate.h)
     uint32_t signature, version; uint64_t currentCapability, highestCapability, sleepFactors;
@@ -113,6 +114,19 @@ static int ecRegNow(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req
 }
 SYSCTL_PROC(_debug, OID_AUTO, wujiesleep_ecreg_now, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, ecRegNow, "I", "write 1: evaluate the EC's _REG(3, 1) now");
 static thread_call_t gEcCall;
+// At the initial power-on too (nullarc PR 20, senqaii-ce): on firmware whose EC has no EmbeddedControl OperationRegion
+// macOS never runs the EC's _REG at all. Here macOS does run it, so this only repeats the same call once the ACPI EC
+// driver is up. The boot-arg -wujiesleepnoecreg leaves the initial power-on alone (the wake path stays).
+static IONotifier *gEcNotifier;
+static bool ecDriverUp(void *, void *, IOService *, IONotifier *) {
+    static bool done = false;
+    if (!done && gEcCall) {
+        done = true;
+        uint64_t d; clock_interval_to_deadline(1000, kMillisecondScale, &d);
+        thread_call_enter_delayed(gEcCall, d);
+    }
+    return true;
+}
 
 class WujieSleepPolicy : public IOService {
     OSDeclareDefaultStructors(WujieSleepPolicy)
@@ -136,6 +150,11 @@ bool WujieSleepPolicy::start(IOService *provider) {
     sysctl_register_oid(&sysctl__debug_wujiesleep_key_writes);
     sysctl_register_oid(&sysctl__debug_wujiesleep_ecreg); sysctl_register_oid(&sysctl__debug_wujiesleep_ecreg_last); sysctl_register_oid(&sysctl__debug_wujiesleep_ecreg_now);
     gEcCall = thread_call_allocate(ecRegister, nullptr);
+    char flag = 0;
+    if (gEcCall && !PE_parse_boot_argn("-wujiesleepnoecreg", &flag, sizeof flag)) {
+        OSDictionary *m = IOService::serviceMatching("AppleACPIEC");
+        if (m) { gEcNotifier = addMatchingNotification(gIOFirstPublishNotification, m, ecDriverUp, nullptr); m->release(); }
+    }
     static IOPMPowerState states[2] = {
         { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { kIOPMPowerStateVersion1, kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 } };
