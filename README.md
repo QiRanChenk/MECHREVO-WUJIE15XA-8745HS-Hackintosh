@@ -89,6 +89,7 @@ tools/brightkeep/    记住屏幕亮度 + 熄屏时关闭背光
 | OpenCore `HibernateMode=Auto`、`HibernateSkipsPicker=true` | 把密钥交给 boot.efi，唤醒时不停在启动菜单 |
 | `sudo pmset -a hibernatemode 25 standby 0 autopoweroff 0 powernap 0 disablesleep 0` | 立即休眠 |
 | 修改版 nullarc（[QiRanChenk/nullarc](https://github.com/QiRanChenk/nullarc) `hibernate-resume` 分支的 PhxBringup + PhxAccel） | 睡眠期间挂起 GPU 提交、唤醒后重绑 VMID、放开 IOFramebuffer 的闸门、重新启用加速器 |
+| `WujieSleepPolicy.kext` 唤醒后重跑 `EC0._REG(3,1)` | 休眠时 EC 断过电，回到非 ACPI 模式，不再上报事件：唤醒后合盖没反应、亮度键失效（音量键正常）。固件只在 `_WAK(4)` 里补写 `XSEC = OSEC`，macOS 这条路径走不到 |
 | `tools/phxwake`（`sudo ./install.sh`） | 每次唤醒后重跑 GPU 初始化（约 3 秒）并触发上面两步 |
 
 注意：唤醒需要按电源键；不要带 `-v` / `debug=0x100` 测试休眠（入睡时会卡死）；一次失败的睡眠可能让 MT7922 无线网卡失灵，需彻底断电（关机、拔电源、长按电源键 20 秒）才能恢复。
@@ -101,6 +102,10 @@ tools/brightkeep/    记住屏幕亮度 + 熄屏时关闭背光
 - **WujieXhciIntx**（原创，MIT）：AppleUSBXHCI 把非等时传输事件放在 interrupter 1，而 AMD 15b9/15ba/15c0/15c1 只有 1 个 MSI 向量且只由 interrupter 0 触发，所以鼠标键盘事件没有中断（PhxXhciKick 用轮询绕过，2 ms 轮询约多耗 0.4 W，8 ms 鼠标发涩）。本 kext 关掉 MSI、启用 INTx，在控制器 work loop 上挂自己的 filter 中断源，清 `USBSTS.EINT`/`IMAN.IP` 后触发 Apple 的中断源；带中断风暴保护（自动退回 MSI）。运行时开关 `sysctl debug.wujiexhci`，计数 `debug.wujiexhci_irqs/_spurious/_storms`。构建：`src/WujieXhciIntx/build.sh <MacKernelSDK>`。
 - **GPU 空闲**：nullarc 没设置 `CP_MEC_DOORBELL_RANGE`，默认范围盖住了图形队列的门铃，第一次敲门铃后 CP 永远报告忙（`GRBM_STATUS 0xa800302c`）。修改版 mesboot 在建队列前写入 Linux 的值（0 / 0x450）。上游 PR #14 有同样的修复。
 - **权限弹窗**：为 nullarc 关闭 AMFI 后，tccd 对第三方应用不弹授权窗（日志 `Policy disallows prompt`），用 `tools/tcc/tcc-grant.sh /Applications/XXX.app` 直接写入摄像头/麦克风授权。
+- **核显空闲功耗（6.5 W → 约 5 W，Linux 为 4.4 W）**：两处，都在 [QiRanChenk/nullarc](https://github.com/QiRanChenk/nullarc)。
+  1. `sdma-unhalt` 分支（上游 PR #24）：nullarc 让 SDMA 引擎一直停机，RLC 等不到它的确认，核显时钟永远不门控。`mesboot` 里解除停机后空闲 6.5 W → 5.8 W。
+  2. `gfxoff` 分支的 PhxBringup + boot-arg `phxgfxoff=1`（config.plist 已含）：空闲时让 PMFW 把核显整块断电（GFXOFF），有提交时再上电，空闲约 5 W。没有这版 PhxBringup 时该参数无效果。
+- **CPU 调频**：`tools/cppc` + nullarc PR #21 的 `PhxCPPC.kext`，在 `tools/powerbar` 菜单里选模式。
 - **GPU 时钟门控**：nullarc 让 `RLC_CGTT_MGCG_OVERRIDE` 保持复位值、CGCG/CGLS 关闭。`tools/gpucg/gpucg.sh all` 按 Linux `gfx_v11_0_update_gfx_clock_gating()` 的顺序打开，SoC 封装空闲 8.8 W → 约 6.8 W，桌面和视频无可见影响。`touch /Users/Shared/gpu/gpucg-off` 可跳过。
 - **GPU 限频**：nullarc 让 GFX 时钟固定 2600 MHz；通过 SMU `SetSoftMaxGfxClk(800)` 空闲功耗从约 50 W 降到约 20 W，桌面与视频无可见影响。
 

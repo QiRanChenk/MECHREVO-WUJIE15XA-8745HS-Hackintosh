@@ -2075,7 +2075,7 @@
 				AAAAAAAAAAAAAAAAAAA=
 				</data>
 				<key>boot-args</key>
-				<string>keepsyms=1 ipc_control_port_options=0 -nohe -amfipassbeta amfi=0x80 amfi_get_out_of_my_way=0x1 phxdebug=1 alcid=21 ryzenidle=1 dk=0x8001 phxkick=0 wujiexhci=1</string>
+				<string>keepsyms=1 ipc_control_port_options=0 -nohe -amfipassbeta amfi=0x80 amfi_get_out_of_my_way=0x1 phxdebug=1 alcid=21 ryzenidle=1 dk=0x8001 phxkick=0 wujiexhci=1 phxgfxoff=1</string>
 				<key>csr-active-config</key>
 				<data>
 				fwgAAA==
