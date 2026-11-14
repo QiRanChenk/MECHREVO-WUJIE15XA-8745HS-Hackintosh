@@ -70,6 +70,16 @@ final class App: NSObject, NSApplicationDelegate {
         ("自动（插电均衡 · 电池省电）", "Automatic (balanced on AC, saver on battery)", "auto"),
         ("高性能", "High performance", "epp 0"), ("均衡", "Balanced", "epp 128"),
         ("省电", "Power saver", "epp 192"), ("极致省电", "Maximum saver", "epp 255")]
+    // closing the lid: sleep (hibernate) or keep running; applied by the root service (pmset disablesleep)
+    let lidItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    func lidAwake() -> Bool {
+        ((try? String(contentsOfFile: modeDir + "/lid", encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines) == "awake"
+    }
+    @objc func toggleLid() {
+        try? FileManager.default.createDirectory(atPath: modeDir, withIntermediateDirectories: true)
+        try? ((lidAwake() ? "sleep" : "awake") + "\n").write(toFile: modeDir + "/lid", atomically: true, encoding: .utf8)
+        lidItem.state = lidAwake() ? .on : .off
+    }
     let langItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let quitItem = NSMenuItem(title: "", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     func sliderText(_ v: Int) -> String { L("性能 ← \(v) → 省电", "Performance ← \(v) → Saver") }
@@ -80,6 +90,7 @@ final class App: NSObject, NSApplicationDelegate {
     func relabel() {
         for (i, it) in modeItems.enumerated() { it.title = L(presets[i].zh, presets[i].en) }
         langItem.title = english ? "中文" : "English"
+        lidItem.title = L("合盖不休眠（继续运行）", "Keep running with the lid closed")
         quitItem.title = L("退出 powerbar", "Quit powerbar")
     }
     var modeItems: [NSMenuItem] = []
@@ -139,6 +150,8 @@ final class App: NSObject, NSApplicationDelegate {
         box.addSubview(sliderLabel); box.addSubview(slider)
         let sl = NSMenuItem(); sl.view = box; menu.addItem(sl)
         menu.addItem(.separator())
+        lidItem.target = self; lidItem.action = #selector(toggleLid); lidItem.state = lidAwake() ? .on : .off
+        menu.addItem(lidItem); menu.addItem(.separator())
         langItem.target = self; langItem.action = #selector(toggleLanguage)
         menu.addItem(langItem); menu.addItem(quitItem)
         relabel()
@@ -181,6 +194,7 @@ final class App: NSObject, NSApplicationDelegate {
         } else { cpuLine.title = L("读不到 CPU 功耗", "No CPU power data") }
         item.button?.title = title
         refreshMode()
+        lidItem.state = lidAwake() ? .on : .off
     }
 }
 

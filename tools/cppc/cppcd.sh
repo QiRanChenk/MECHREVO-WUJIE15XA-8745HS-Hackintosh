@@ -9,7 +9,11 @@ D=/Users/Shared/cppc; mkdir -p $D; chmod 777 $D
 AC_EPP=128; BATT_EPP=192
 for i in $(seq 1 60); do sysctl -n debug.phx_cppc_supported >/dev/null 2>&1 && break; sleep 2; done
 [ "$(sysctl -n debug.phx_cppc_supported 2>/dev/null)" = 1 ] || { echo "no PhxCPPC" > $D/status; exit 0; }
-last=""; n=0; src=""
+# Two more settings ride on this service because they need root as well:
+#   /Users/Shared/cppc/lid     "awake" = closing the lid does not sleep (pmset disablesleep 1); anything else = it does
+#   /Users/Shared/cppc/gfxoff-off   present = leave GFXOFF alone; absent = keep debug.phx_pm_gfxoff at 1 (the kext's
+#                              sysctl does not survive a reboot)
+last=""; n=0; src=""; lidlast=""
 while :; do
     m=auto; v=; [ -r $D/mode ] && read -r m v < $D/mode
     # the power source every third round, the mode file every round: a choice in the menu applies within a second
@@ -24,6 +28,16 @@ while :; do
         sysctl -w debug.phx_cppc_apply=1 >/dev/null 2>&1
         echo "$mode $epp $src" > $D/status.tmp && mv $D/status.tmp $D/status; chmod 644 $D/status
         last=$epp; n=0
+    fi
+    lid=sleep; [ -r $D/lid ] && read -r lid < $D/lid
+    [ "$lid" = awake ] || lid=sleep
+    if [ "$lid" != "$lidlast" ]; then
+        if [ $lid = awake ]; then pmset -a disablesleep 1 >/dev/null 2>&1; else pmset -a disablesleep 0 >/dev/null 2>&1; fi
+        echo "$lid" > $D/lid-status; chmod 644 $D/lid-status; lidlast=$lid
+    fi
+    if [ $((n % 10)) = 0 ] && [ ! -e $D/gfxoff-off ] && [ "$(sysctl -n debug.phx_pm_gfxoff 2>/dev/null)" = 0 ] \
+       && [ "$(sysctl -n debug.nvaccel_iop_ok 2>/dev/null || echo 0)" != 0 ]; then
+        sysctl -w debug.phx_pm_gfxoff=1 >/dev/null 2>&1
     fi
     n=$((n + 1)); sleep 1
 done
