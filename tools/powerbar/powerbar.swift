@@ -666,6 +666,32 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if changed { resize() }
     }
 
+    // ---- touchpad ----
+    // Now and then the I2C touchpad is not found at boot (VoodooI2C's controller starts but no device nub appears, so
+    // VoodooI2CHID never loads; 2026-11-13 and 2026-11-15). Nothing short of a restart brings it back, so a minute after a
+    // boot without it the user is asked whether to restart.
+    var touchpadChecked = false
+    func checkTouchpad() {
+        guard !touchpadChecked else { return }
+        let up = ProcessInfo.processInfo.systemUptime
+        if up < 60 { return }
+        touchpadChecked = true
+        if up > 600 { return }       // only right after a boot
+        var it: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("VoodooI2CHIDDevice"), &it) == KERN_SUCCESS else { return }
+        let found = IOIteratorNext(it); IOObjectRelease(it)
+        if found != 0 { IOObjectRelease(found); return }
+        let a = NSAlert()
+        a.messageText = L("触摸板没有被识别", "The touchpad was not found")
+        a.informativeText = L("这次开机触摸板驱动没有找到触摸板（偶发），重启一次即可恢复。现在重启吗？", "Its driver did not find the touchpad this boot (it happens now and then). A restart brings it back. Restart now?")
+        a.addButton(withTitle: L("重启", "Restart")); a.addButton(withTitle: L("稍后", "Later"))
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertFirstButtonReturn {
+            let p = Process(); p.launchPath = "/usr/bin/osascript"; p.arguments = ["-e", "tell application \"System Events\" to restart"]
+            try? p.run()
+        }
+    }
+
     // ---- lid ----
     func lidAwake() -> Bool { readLine(modeDir + "/lid") == "awake" }
     @objc func toggleLid(_ s: NSSwitch) { writeLine(modeDir + "/lid", s.state == .on ? "awake" : "sleep") }
@@ -840,10 +866,27 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshGpu()
         refreshExt()
         trackPanel()
+        checkTouchpad()
         lidSwitch.state = lidAwake() ? .on : .off
     }
 }
 
+// the view drawn over the window background of its appearance (a bare cacheDisplay is transparent: white text on
+// nothing looked like an empty picture in dark mode)
+@discardableResult func snapshotPNG(_ v: NSView, _ path: String, _ look: NSAppearance) -> NSBitmapImageRep {
+    let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
+    let dark = look.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+    let ctx = NSGraphicsContext(bitmapImageRep: rep)!
+    NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = ctx
+    look.performAsCurrentDrawingAppearance {
+        (dark ? NSColor(calibratedWhite: 0.16, alpha: 1) : NSColor(calibratedWhite: 0.96, alpha: 1)).setFill()
+        v.bounds.fill()
+        v.displayIgnoringOpacity(v.bounds, in: ctx)
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    try? rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
+    return rep
+}
 let app = NSApplication.shared
 let delegate = App()
 // powerbar --snapshot <file.png> [dark]: draw the panel once into a picture (for looking at the layout), with sample
@@ -874,9 +917,7 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot" {
     let win = NSWindow(contentRect: NSRect(origin: .zero, size: v.frame.size), styleMask: [.borderless], backing: .buffered, defer: false)
     win.backgroundColor = .windowBackgroundColor; win.contentView = v; win.appearance = app.appearance
     v.layoutSubtreeIfNeeded(); v.display()
-    let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
-    v.cacheDisplay(in: v.bounds, to: rep)
-    try? rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
+    snapshotPNG(v, CommandLine.arguments[2], app.appearance!)
     exit(0)
 }
 // powerbar --snapshot-records <file.png> [dark] [segment]: the records window with three made-up days
@@ -895,9 +936,7 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot-rec
     if CommandLine.arguments.count > 4, let n = Int(CommandLine.arguments[4]) { delegate.rangeSeg.selectedSegment = n }
     w.appearance = app.appearance; delegate.refreshRecords()
     let v = w.contentView!; v.layoutSubtreeIfNeeded(); v.display()
-    let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
-    v.cacheDisplay(in: v.bounds, to: rep)
-    try? rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
+    let rep = snapshotPNG(v, CommandLine.arguments[2], app.appearance!)
     var t = Date(); for _ in 0..<20 { delegate.recordsCount = -1; delegate.refreshRecords() }
     let tq = Date().timeIntervalSince(t) / 20; t = Date()
     for _ in 0..<20 { delegate.rangeChart.cacheDisplay(in: delegate.rangeChart.bounds, to: rep) }

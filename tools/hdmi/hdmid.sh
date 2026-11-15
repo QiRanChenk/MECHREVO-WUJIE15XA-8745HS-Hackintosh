@@ -95,7 +95,7 @@ bright_apply() {
   apply volume 0x62 $amax && { acur=$v; put_state; }
 }
 say "hdmid start${FIX:+ (port $FIX, head $HEAD)}"
-dark=0; n=0; bs=0; hot=0; act="$FIX"; fails=0; lastfail=0
+dark=0; n=0; bs=0; hot=0; act="$FIX"; fails=0; lastfail=0; linkbad=0
 while :; do
   [ -n "$act" ] && bright_apply
   if [ $hot -gt 0 ]; then hot=$(( hot - 1 )); sleep 0.1; [ $(( hot % 20 )) = 0 ] || continue
@@ -114,6 +114,20 @@ while :; do
   [ "$pw" = 0 ] && dark=$(( dark + 1 )) || dark=0
   # a monitor may take a few seconds after the link comes up before it answers DDC/CI: up to five tries
   if [ $hpd = 1 ] && [ $lit = 1 ] && [ $dark = 0 ] && [ $vmax = 0 ] && [ $bs -lt 5 ]; then bright_state; bs=$(( bs + 1 )); fi
+  # DisplayPort link check every ~6 s: a monitor switched off and on (or an adapter that lost the link) keeps HPD up
+  # but the link drops; the sink's lane status (DPCD 0x202 lanes 0-1 locked = 0x77, 0x204 bit 0 = lanes aligned) shows
+  # it. Two bad reads in a row: the port is lit again. An AUX read that fails (sink gone) is not counted.
+  if [ $act = dp ] && [ $hpd = 1 ] && [ $lit = 1 ] && [ $dark = 0 ] && [ $(( n % 12 )) = 1 ]; then
+    lock; ls=$(./dmubboot aux rd 0x202 3 2>/dev/null | tail -1); unlock
+    set -- $ls
+    if [ $# -eq 3 ] && [ "${#1}" = 2 ]; then
+      if [ "$1" = 77 ] && [ $(( 0x$3 & 1 )) = 1 ]; then linkbad=0; else linkbad=$(( linkbad + 1 )); fi
+      if [ $linkbad -ge 2 ]; then
+        say "DP link lost (lane status $ls): lighting again"; linkbad=0
+        ./fb1cfg offline >/dev/null; dark_port; sleep 1; light; say "-> hw $(sysctl -n debug.phxfb1_hw), $(./fb1cfg show)"
+      fi
+    fi
+  fi
   # the monitor's name for the menu, also for a port that was lit before this copy started
   if [ $hpd = 1 ] && [ $lit = 1 ] && [ ! -s $S/name$X ]; then
     [ -s $E ] || { lock; if [ $act = dp ]; then ./dmubboot aux edid $E; else ./ddcbb edid $E; fi >/dev/null 2>&1; unlock; }

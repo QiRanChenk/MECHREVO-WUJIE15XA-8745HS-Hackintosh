@@ -21,6 +21,16 @@ for i in $(seq 1 60); do sysctl -n debug.phx_cppc_supported >/dev/null 2>&1 && b
 #                              800-2600 (2600 = what the firmware allows without a cap; higher caps cost idle power).
 #                              Written again 45 s and 120 s after the start and after a wake: the boot and wake scripts
 #                              set their own value first. What is in force goes to /Users/Shared/cppc/gpu-status.
+# The keyboard backlight (EC RAM 0x078c bits 5-7 = level 0..4, written with bit 4 set; WujieSleepPolicy's sysctls):
+#   - its level is kept in /Users/Shared/cppc/kbd and put back at boot and after a wake (the firmware lights it again);
+#   - off while the lid is closed, back when it opens. WujieSleepPolicy does this on the clamshell message too, but with
+#     "keep running with the lid closed" (pmset disablesleep) the light stayed on (2026-11-15), so it is done here from
+#     the lid state as well.
+ec() { sysctl -w debug.wujie_ec_addr=1932 >/dev/null 2>&1 || return 1; if [ -n "$1" ]; then sysctl -w debug.wujie_ec_val=$1 >/dev/null 2>&1; else sysctl -n debug.wujie_ec_val 2>/dev/null; fi; }
+kbd_set() { ec $(( ($1 << 5) | 0x10 )); }           # level 0..4
+kbd_get() { local v; v=$(ec) || return 1; [ -n "$v" ] && [ "$v" -ge 0 ] && echo $(( (v >> 5) & 7 )); }
+lid_closed() { ioreg -r -k AppleClamshellState -d1 | grep -q '"AppleClamshellState" = Yes'; }
+kbdlast=""; kbdlid=0; kbdboot=1
 last=""; n=0; src=""; lidlast=""; prev=""; glast=""; ticks=0
 while :; do
     m=auto; v=; [ -r $D/mode ] && read -r m v < $D/mode
@@ -58,6 +68,18 @@ while :; do
     if [ "$lid" != "$lidlast" ]; then
         if [ $lid = awake ]; then pmset -a disablesleep 1 >/dev/null 2>&1; else pmset -a disablesleep 0 >/dev/null 2>&1; fi
         echo "$lid" > $D/lid-status; chmod 644 $D/lid-status; lidlast=$lid
+    fi
+    # keyboard light: restore once after the start and after every wake, follow the lid every round, remember the
+    # level the user picks with Fn every few rounds (while the lid is open)
+    if [ $kbdboot = 1 ] || [ $woke = 1 ]; then
+        k=$(cat $D/kbd 2>/dev/null); case "$k" in [0-4]) lid_closed || kbd_set $k ;; esac; kbdboot=0; kbdlast=$k
+    fi
+    if lid_closed; then
+        if [ $kbdlid = 0 ]; then kbdlid=1; k=$(kbd_get); [ -n "$k" ] && [ "$k" != 0 ] && kbd_set 0; fi
+    elif [ $kbdlid = 1 ]; then
+        kbdlid=0; k=$(cat $D/kbd 2>/dev/null); case "$k" in [1-4]) [ "$(kbd_get)" = 0 ] && kbd_set $k ;; esac
+    elif [ $((n % 3)) = 1 ]; then
+        k=$(kbd_get); if [ -n "$k" ] && [ "$k" != "$kbdlast" ]; then echo $k > $D/kbd; chmod 644 $D/kbd; kbdlast=$k; fi
     fi
     if [ $((n % 10)) = 0 ] && [ ! -e $D/gfxoff-off ] && [ "$(sysctl -n debug.phx_pm_gfxoff 2>/dev/null)" = 0 ] \
        && [ "$(sysctl -n debug.nvaccel_iop_ok 2>/dev/null || echo 0)" != 0 ]; then
