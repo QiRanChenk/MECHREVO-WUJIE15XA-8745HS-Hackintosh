@@ -3,8 +3,10 @@
 // CPU: AMDRyzenCPUPowerManagement user client selector 4 (first float = package watts).
 // CPU mode: writes the choice to /Users/Shared/cppc/mode ("auto" or "epp <0-255>"); the root service cppcd applies it
 // through PhxCPPC.kext (AMD CPPC energy-performance preference) and reports in /Users/Shared/cppc/status.
-// External monitor: /Users/Shared/hdmi/state ("<brightness> <max>", written by the root service hdmid while a monitor
-// on the HDMI port answers DDC/CI) shows a brightness slider; the choice goes to /Users/Shared/hdmi/brightness.
+// GPU clock cap: /Users/Shared/cppc/gpu ("auto" or MHz), applied by cppcd too (SMU SetSoftMaxGfxClk); status in gpu-status.
+// External monitor: /Users/Shared/hdmi/state ("<brightness> <max> <volume> <max>", written by the root service hdmid
+// while a monitor answers DDC/CI) shows brightness and volume sliders; choices go to /Users/Shared/hdmi/brightness|volume.
+// The menu is one panel (a single view in the status item's menu): a readout card and a card per group of controls.
 import Cocoa
 import IOKit
 
@@ -55,70 +57,199 @@ final class CPUPower {
     }
 }
 
-final class App: NSObject, NSApplicationDelegate {
+
+// ---- small view helpers ------------------------------------------------------------------------------------------
+func label(_ s: String = "", size: CGFloat = 13, weight: NSFont.Weight = .regular, color: NSColor = .labelColor, mono: Bool = false) -> NSTextField {
+    let t = NSTextField(labelWithString: s)
+    t.font = mono ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight) : NSFont.systemFont(ofSize: size, weight: weight)
+    t.textColor = color; t.lineBreakMode = .byTruncatingTail
+    t.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    return t
+}
+func symbol(_ name: String, size: CGFloat = 14) -> NSImageView {
+    let v = NSImageView()
+    if let i = NSImage(systemSymbolName: name, accessibilityDescription: nil) {
+        v.image = i.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: size, weight: .medium))
+    }
+    v.contentTintColor = .secondaryLabelColor
+    v.widthAnchor.constraint(equalToConstant: size > 20 ? 36 : 22).isActive = true
+    v.heightAnchor.constraint(equalToConstant: size + 6).isActive = true
+    v.imageScaling = .scaleProportionallyDown
+    return v
+}
+func spacer() -> NSView {      // takes the free width of a row, no height of its own
+    let v = NSView(); v.setContentHuggingPriority(.init(1), for: .horizontal)
+    let h = v.heightAnchor.constraint(equalToConstant: 1); h.priority = .defaultHigh; h.isActive = true
+    return v
+}
+func hstack(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView {
+    let s = NSStackView(views: views); s.orientation = .horizontal; s.spacing = spacing; s.alignment = .centerY; return s
+}
+// a rounded card with a caption above its content
+final class Card: NSView {
+    let stack = NSStackView()
+    let caption = label(size: 11, weight: .semibold, color: .secondaryLabelColor)
+    init(_ rows: [NSView]) {
+        super.init(frame: .zero)
+        wantsLayer = true; layer?.cornerRadius = 10
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8
+        stack.setHuggingPriority(.required, for: .vertical)
+        stack.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([stack.topAnchor.constraint(equalTo: topAnchor), stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+                                     stack.leadingAnchor.constraint(equalTo: leadingAnchor), stack.trailingAnchor.constraint(equalTo: trailingAnchor)])
+        stack.addArrangedSubview(caption)
+        for r in rows { stack.addArrangedSubview(r); r.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive = true }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func updateLayer() { layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor }
+    override var wantsUpdateLayer: Bool { true }
+}
+
+final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let cpu = CPUPower()
-    let detail = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    let cpuLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    let timeLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    let width: CGFloat = 340
     var lastWatts: Double = 0
     var battAvg: Double? = nil      // battery watts averaged over about a minute: the estimate should not jump
+    var cpuAvg: Double? = nil
+    let modeDir = "/Users/Shared/cppc", extDir = "/Users/Shared/hdmi"
+
+    // readout
+    let bigWatts = label(size: 28, weight: .semibold, mono: true)
+    let battState = label(size: 12, color: .secondaryLabelColor)
+    let battIcon = symbol("battery.75", size: 22)
+    let timeLine = label(size: 12)
+    let cpuLine = label(size: 12, color: .secondaryLabelColor, mono: true)
+
+    // CPU mode (CPPC energy-performance preference): presets, a stepless slider, and what the service applied
+    let presets: [(zh: String, en: String, mode: String)] = [
+        ("自动", "Auto", "auto"), ("性能", "Perf", "epp 0"), ("均衡", "Balanced", "epp 128"), ("省电", "Saver", "epp 192"), ("极省", "Max", "epp 255")]
+    let modeSeg = NSSegmentedControl(labels: ["", "", "", "", ""], trackingMode: .selectOne, target: nil, action: nil)
+    let slider = NSSlider(value: 128, minValue: 0, maxValue: 255, target: nil, action: nil)
+    let sliderLeft = label(size: 11, color: .secondaryLabelColor), sliderRight = label(size: 11, color: .secondaryLabelColor)
+    let modeLine = label(size: 11, color: .secondaryLabelColor, mono: true)
     var pendingWrite: Timer? = nil
     var pendingMode: String? = nil  // chosen but not yet reported back by the service
-    var cpuAvg: Double? = nil
-    // CPU mode (CPPC energy-performance preference): presets, a stepless slider, and what the service applied
-    let modeDir = "/Users/Shared/cppc"
-    let presets: [(zh: String, en: String, mode: String)] = [
-        ("自动（插电均衡 · 电池省电）", "Automatic (balanced on AC, saver on battery)", "auto"),
-        ("高性能", "High performance", "epp 0"), ("均衡", "Balanced", "epp 128"),
-        ("省电", "Power saver", "epp 192"), ("极致省电", "Maximum saver", "epp 255")]
-    // closing the lid: sleep (hibernate) or keep running; applied by the root service (pmset disablesleep)
-    let lidItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    func lidAwake() -> Bool {
-        ((try? String(contentsOfFile: modeDir + "/lid", encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines) == "awake"
-    }
-    @objc func toggleLid() {
-        try? FileManager.default.createDirectory(atPath: modeDir, withIntermediateDirectories: true)
-        try? ((lidAwake() ? "sleep" : "awake") + "\n").write(toFile: modeDir + "/lid", atomically: true, encoding: .utf8)
-        lidItem.state = lidAwake() ? .on : .off
-    }
-    let langItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    let quitItem = NSMenuItem(title: "", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-    func sliderText(_ v: Int) -> String { L("性能 ← \(v) → 省电", "Performance ← \(v) → Saver") }
-    @objc func toggleLanguage() {
-        english.toggle(); UserDefaults.standard.set(english, forKey: "english")
-        extSetAt = Date.distantPast; volSetAt = Date.distantPast
-        relabel(); tick()
-    }
-    func relabel() {
-        for (i, it) in modeItems.enumerated() { it.title = L(presets[i].zh, presets[i].en) }
-        langItem.title = english ? "中文" : "English"
-        lidItem.title = L("合盖不休眠（继续运行）", "Keep running with the lid closed")
-        quitItem.title = L("退出 powerbar", "Quit powerbar")
-    }
-    // the external monitor's own brightness (DDC/CI), applied by the root service hdmid
-    let extDir = "/Users/Shared/hdmi"
+
+    // GPU clock cap: automatic (800 MHz alone, 1600 with an external display) or a value from 800 to 2600 MHz in 100 MHz steps
+    let gpuAuto = NSSwitch()
+    let gpuAutoLabel = label(size: 12)
+    let gpuSlider = NSSlider(value: 800, minValue: 800, maxValue: 2600, target: nil, action: nil)
+    let gpuValue = label(size: 12, weight: .medium, mono: true)
+    let gpuLine = label(size: 11, color: .secondaryLabelColor)
+    var gpuWrite: Timer? = nil
+    var gpuSetAt = Date.distantPast
+
+    // the external monitor's own brightness and speaker volume (DDC/CI), applied by the root service hdmid
     let extSlider = NSSlider(value: 50, minValue: 0, maxValue: 100, target: nil, action: nil)
-    let extLabel = NSTextField(labelWithString: "")
-    let extItem = NSMenuItem()
-    var extWrite: Timer? = nil
-    var extSetAt = Date.distantPast
-    func extText(_ v: Int) -> String { L("外接显示器亮度 \(v)%", "External display brightness \(v)%") }
-    var extSentAt = Date.distantPast
-    @objc func extSlid(_ s: NSSlider) {
+    let volSlider = NSSlider(value: 50, minValue: 0, maxValue: 100, target: nil, action: nil)
+    let extValue = label(size: 12, mono: true), volValue = label(size: 12, mono: true)
+    var extRow: NSView!, volRow: NSView!
+    var extSent = [Date.distantPast, Date.distantPast], extSet = [Date.distantPast, Date.distantPast]
+    var extTimer: [Timer?] = [nil, nil]
+
+    // options
+    let lidSwitch = NSSwitch()
+    let lidLabel = label(size: 12)
+    let langButton = NSButton(title: "", target: nil, action: nil), quitButton = NSButton(title: "", target: nil, action: nil)
+
+    var cards: [Card] = []
+    var extCard: Card!
+    let panel = NSStackView()
+    let panelItem = NSMenuItem()
+
+    func readLine(_ path: String) -> String { ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
+    func writeLine(_ path: String, _ s: String) {
+        try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try? (s + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    // ---- CPU mode ----
+    func currentMode() -> String { let m = readLine(modeDir + "/mode"); return m.isEmpty ? "auto" : m }
+    func setMode(_ m: String) { writeLine(modeDir + "/mode", m); pendingMode = m; refreshMode() }
+    @objc func pickPreset(_ s: NSSegmentedControl) { setMode(presets[s.selectedSegment].mode) }
+    @objc func slid(_ s: NSSlider) {
         let v = Int(s.doubleValue.rounded())
-        extLabel.stringValue = extText(v); extSetAt = Date()
+        modeLine.stringValue = "EPP \(v)"
+        // a drag sends a value for every step: write only the one it settles on (0.3 s without another)
+        pendingWrite?.invalidate()
+        let t = Timer(timeInterval: 0.3, repeats: false) { _ in self.setMode("epp \(v)") }
+        RunLoop.main.add(t, forMode: .common); pendingWrite = t
+    }
+    func refreshMode() {
+        let m = currentMode()
+        modeSeg.selectedSegment = presets.firstIndex { $0.mode == m } ?? -1
+        let st = readLine(modeDir + "/status").split(separator: " ").map(String.init)
+        if st.count >= 3, let epp = Int(st[1]) {
+            // the service takes up to a second to apply a choice: until its report matches, say so instead of showing
+            // the old value, and leave the slider where the user put it
+            let want = m.hasPrefix("epp ") ? Int(m.dropFirst(4)) : nil
+            let applied = (want == nil && st[0] == "auto") || (want != nil && st[0] == "epp" && want == epp)
+            if applied { pendingMode = nil }
+            let src = st[2] == "ac" ? L("插电", "AC") : L("电池", "battery")
+            let how = st[0] == "auto" ? L("自动", "auto") : L("手动", "manual")
+            if pendingMode != nil && !applied { modeLine.stringValue = L("正在应用…", "applying…") }
+            else if pendingWrite?.isValid != true { modeLine.stringValue = "EPP \(epp) · \(how) · \(src)" }
+            if pendingWrite?.isValid != true && pendingMode == nil { slider.doubleValue = Double(epp) }
+        } else { modeLine.stringValue = L("服务未运行", "service not running") }
+    }
+
+    // ---- GPU clock cap ----
+    @objc func gpuAutoToggled(_ s: NSSwitch) { writeLine(modeDir + "/gpu", s.state == .on ? "auto" : "\(Int(gpuSlider.doubleValue))"); gpuSetAt = Date(); refreshGpu() }
+    @objc func gpuSlid(_ s: NSSlider) {
+        let v = Int((s.doubleValue / 100).rounded()) * 100
+        s.doubleValue = Double(v); gpuValue.stringValue = "\(v) MHz"; gpuSetAt = Date()
+        gpuAuto.state = .off
+        gpuWrite?.invalidate()
+        let t = Timer(timeInterval: 0.3, repeats: false) { _ in self.writeLine(self.modeDir + "/gpu", "\(v)") }
+        RunLoop.main.add(t, forMode: .common); gpuWrite = t
+    }
+    func refreshGpu() {
+        let want = readLine(modeDir + "/gpu")
+        let auto = Int(want) == nil
+        let st = readLine(modeDir + "/gpu-status").split(separator: " ").map(String.init)
+        let cap = st.count >= 2 ? Int(st[1]) : nil
+        if Date().timeIntervalSince(gpuSetAt) > 3 {      // not under the user's hand
+            gpuAuto.state = auto ? .on : .off
+            if let v = auto ? cap : Int(want) { gpuSlider.doubleValue = Double(v); gpuValue.stringValue = "\(v) MHz" }
+        }
+        if let c = cap { gpuLine.stringValue = L("当前上限 \(c) MHz · 越高越流畅，也越耗电", "Cap now \(c) MHz · higher is smoother and draws more") }
+        else { gpuLine.stringValue = L("服务未运行", "service not running") }
+    }
+
+    // ---- external monitor: brightness (0) and volume (1) ----
+    func extSend(_ which: Int, _ v: Int) {
         // follow the drag: a value goes out at once, at most one every 0.12 s (a DDC/CI write takes about that long),
         // and the one the slider settles on always does
-        extWrite?.invalidate()
-        let send = { try? "\(v)\n".write(toFile: self.extDir + "/brightness", atomically: true, encoding: .utf8); self.extSentAt = Date() }
-        let since = Date().timeIntervalSince(extSentAt)
+        extSet[which] = Date()
+        extTimer[which]?.invalidate()
+        let file = extDir + (which == 0 ? "/brightness" : "/volume")
+        let send = { self.writeLine(file, "\(v)"); self.extSent[which] = Date() }
+        let since = Date().timeIntervalSince(extSent[which])
         if since >= 0.12 { send() }
         else {
             let t = Timer(timeInterval: 0.12 - since, repeats: false) { _ in send() }
-            RunLoop.main.add(t, forMode: .common); extWrite = t
+            RunLoop.main.add(t, forMode: .common); extTimer[which] = t
         }
     }
+    @objc func extSlid(_ s: NSSlider) { let v = Int(s.doubleValue.rounded()); extValue.stringValue = "\(v)%"; extSend(0, v) }
+    @objc func volSlid(_ s: NSSlider) { let v = Int(s.doubleValue.rounded()); volValue.stringValue = "\(v)%"; extSend(1, v) }
+    func refreshExt() {
+        let st = readLine(extDir + "/state").split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int($0) }
+        let hasB = st.count >= 2 && st[1] > 0, hasV = st.count >= 4 && st[3] > 0
+        let was = extCard.isHidden
+        extCard.isHidden = !(hasB || hasV); extRow.isHidden = !hasB; volRow.isHidden = !hasV
+        if hasB, Date().timeIntervalSince(extSet[0]) > 5 { let p = Int((Double(st[0]) * 100 / Double(st[1])).rounded()); extSlider.doubleValue = Double(p); extValue.stringValue = "\(p)%" }
+        if hasV, Date().timeIntervalSince(extSet[1]) > 5 { let p = Int((Double(st[2]) * 100 / Double(st[3])).rounded()); volSlider.doubleValue = Double(p); volValue.stringValue = "\(p)%" }
+        if was != extCard.isHidden { resize() }
+    }
+
+    // ---- lid ----
+    func lidAwake() -> Bool { readLine(modeDir + "/lid") == "awake" }
+    @objc func toggleLid(_ s: NSSwitch) { writeLine(modeDir + "/lid", s.state == .on ? "awake" : "sleep") }
+
     // The panel's brightness across the lid. Beside an external monitor the panel leaves the desktop while the lid is
     // closed; when it comes back corebrightnessd starts over at full brightness in its books (the slider) without
     // touching the panel, which the driver has put back at its old level. The level from before the lid closed is
@@ -143,8 +274,7 @@ final class App: NSObject, NSApplicationDelegate {
     func trackPanel() {
         guard let ds = ds, let g = dlsym(ds, "DisplayServicesGetBrightness"), let p = dlsym(ds, "DisplayServicesSetBrightness") else { return }
         let get = unsafeBitCast(g, to: DSGet.self), set = unsafeBitCast(p, to: DSSet.self)
-        let closed = lidClosed()
-        if closed { lidWasClosed = true; restoreTries = 0; return }
+        if lidClosed() { lidWasClosed = true; restoreTries = 0; return }
         guard let d = builtinDisplay() else { return }          // not back on the desktop yet
         if lidWasClosed {
             if let want = panelLevel, restoreTries < 2 { _ = set(d, want); restoreTries += 1; return }
@@ -153,145 +283,79 @@ final class App: NSObject, NSApplicationDelegate {
         var v: Float = 0
         if get(d, &v) == 0, v > 0.004 { panelLevel = v }
     }
-    // the monitor's speaker volume (DDC/CI VCP 0x62): HDMI audio is digital and macOS offers no volume for it
-    let volSlider = NSSlider(value: 50, minValue: 0, maxValue: 100, target: nil, action: nil)
-    let volLabel = NSTextField(labelWithString: "")
-    let volItem = NSMenuItem()
-    var volWrite: Timer? = nil
-    var volSetAt = Date.distantPast, volSentAt = Date.distantPast
-    func volText(_ v: Int) -> String { L("外接显示器音量 \(v)%", "External display volume \(v)%") }
-    @objc func volSlid(_ s: NSSlider) {
-        let v = Int(s.doubleValue.rounded())
-        volLabel.stringValue = volText(v); volSetAt = Date()
-        volWrite?.invalidate()
-        let send = { try? "\(v)\n".write(toFile: self.extDir + "/volume", atomically: true, encoding: .utf8); self.volSentAt = Date() }
-        let since = Date().timeIntervalSince(volSentAt)
-        if since >= 0.12 { send() }
-        else {
-            let t = Timer(timeInterval: 0.12 - since, repeats: false) { _ in send() }
-            RunLoop.main.add(t, forMode: .common); volWrite = t
-        }
-    }
-    func refreshExt() {
-        let st = ((try? String(contentsOfFile: extDir + "/state", encoding: .utf8)) ?? "").split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int($0) }
-        extItem.isHidden = st.count < 2 || st[1] <= 0
-        if st.count >= 2, st[1] > 0, Date().timeIntervalSince(extSetAt) > 5 {   // not under the user's hand
-            let pct = Int((Double(st[0]) * 100 / Double(st[1])).rounded())
-            extSlider.doubleValue = Double(pct); extLabel.stringValue = extText(pct)
-        }
-        volItem.isHidden = st.count < 4 || st[3] <= 0
-        if st.count >= 4, st[3] > 0, Date().timeIntervalSince(volSetAt) > 5 {
-            let pct = Int((Double(st[2]) * 100 / Double(st[3])).rounded())
-            volSlider.doubleValue = Double(pct); volLabel.stringValue = volText(pct)
-        }
-    }
-    // the 780M's clock cap, applied by the root service cppcd (/Users/Shared/cppc/gpu: "auto" or MHz)
-    let gpuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    let gpuMenu = NSMenu()
-    let gpuChoices: [(zh: String, en: String, value: String)] = [
-        ("自动（单屏 800 · 外接屏 1600 MHz）", "Automatic (800 MHz alone, 1600 with an external display)", "auto"),
-        ("800 MHz（最省电）", "800 MHz (lowest power)", "800"), ("1200 MHz", "1200 MHz", "1200"), ("1600 MHz", "1600 MHz", "1600"),
-        ("2000 MHz", "2000 MHz", "2000"), ("2600 MHz（不限制，最耗电）", "2600 MHz (no cap, highest power)", "2600")]
-    @objc func pickGpu(_ s: NSMenuItem) {
-        try? FileManager.default.createDirectory(atPath: modeDir, withIntermediateDirectories: true)
-        try? (gpuChoices[s.tag].value + "\n").write(toFile: modeDir + "/gpu", atomically: true, encoding: .utf8)
-        refreshGpu()
-    }
-    func refreshGpu() {
-        let want = ((try? String(contentsOfFile: modeDir + "/gpu", encoding: .utf8)) ?? "auto").trimmingCharacters(in: .whitespacesAndNewlines)
-        for (i, it) in gpuMenu.items.enumerated() { it.state = gpuChoices[i].value == want || (i == 0 && Int(want) == nil) ? .on : .off; it.title = L(gpuChoices[i].zh, gpuChoices[i].en) }
-        let st = ((try? String(contentsOfFile: modeDir + "/gpu-status", encoding: .utf8)) ?? "").split(whereSeparator: { $0 == " " || $0 == "\n" }).map(String.init)
-        if st.count >= 2 { gpuItem.title = L("核显频率上限：\(st[1]) MHz（\(st[0] == "auto" ? "自动" : "手动")）", "GPU clock cap: \(st[1]) MHz (\(st[0] == "auto" ? "auto" : "manual"))") }
-        else { gpuItem.title = L("核显频率上限", "GPU clock cap") }
-    }
-    var modeItems: [NSMenuItem] = []
-    let modeLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    let slider = NSSlider(value: 128, minValue: 0, maxValue: 255, target: nil, action: nil)
-    let sliderLabel = NSTextField(labelWithString: "")
 
-    func currentMode() -> String {
-        ((try? String(contentsOfFile: modeDir + "/mode", encoding: .utf8)) ?? "auto").trimmingCharacters(in: .whitespacesAndNewlines)
+    // ---- language, layout ----
+    @objc func toggleLanguage() {
+        english.toggle(); UserDefaults.standard.set(english, forKey: "english")
+        extSet = [Date.distantPast, Date.distantPast]
+        relabel(); tick(); resize()
     }
-    func setMode(_ m: String) {
-        try? FileManager.default.createDirectory(atPath: modeDir, withIntermediateDirectories: true)
-        try? (m + "\n").write(toFile: modeDir + "/mode", atomically: true, encoding: .utf8)
-        pendingMode = m
-        refreshMode()
+    @objc func quit() { NSApp.terminate(nil) }
+    func relabel() {
+        let caps = [L("电源", "POWER"), L("处理器", "PROCESSOR"), L("核显", "GRAPHICS"), L("外接显示器", "EXTERNAL DISPLAY"), L("选项", "OPTIONS")]
+        for (i, c) in cards.enumerated() { c.caption.stringValue = caps[i] }
+        for (i, p) in presets.enumerated() { modeSeg.setLabel(L(p.zh, p.en), forSegment: i) }
+        sliderLeft.stringValue = L("性能", "Performance"); sliderRight.stringValue = L("省电", "Saver")
+        gpuAutoLabel.stringValue = L("自动（单屏 800 · 外接屏 1600 MHz）", "Automatic (800 MHz alone, 1600 with a display)")
+        lidLabel.stringValue = L("合盖不休眠（继续运行）", "Keep running with the lid closed")
+        langButton.title = english ? "中文" : "English"
+        quitButton.title = L("退出 powerbar", "Quit powerbar")
     }
-    @objc func pickPreset(_ s: NSMenuItem) { setMode(presets[s.tag].mode) }
-    @objc func slid(_ s: NSSlider) {
-        let v = Int(s.doubleValue.rounded())
-        sliderLabel.stringValue = sliderText(v)
-        // a drag sends a value for every step: write only the one it settles on (0.3 s without another)
-        pendingWrite?.invalidate()
-        let t = Timer(timeInterval: 0.3, repeats: false) { _ in self.setMode("epp \(v)") }
-        RunLoop.main.add(t, forMode: .common); pendingWrite = t
+    func resize() {
+        panel.layoutSubtreeIfNeeded()
+        let h = panel.fittingSize.height
+        panel.setFrameSize(NSSize(width: width, height: h))
+        panelItem.view = panel
     }
-    func refreshMode() {
-        let m = currentMode()
-        for (i, it) in modeItems.enumerated() { it.state = presets[i].mode == m ? .on : .off }
-        let st = ((try? String(contentsOfFile: modeDir + "/status", encoding: .utf8)) ?? "").split(separator: " ").map(String.init)
-        if st.count >= 3, let epp = Int(st[1]) {
-            // the service takes up to a second to apply a choice: until its report matches, say so instead of showing
-            // the old value, and leave the slider where the user put it
-            let want = m.hasPrefix("epp ") ? Int(m.dropFirst(4)) : nil
-            let applied = (want == nil && st[0] == "auto") || (want != nil && st[0] == "epp" && want == epp)
-            if applied { pendingMode = nil }
-            let src = st[2] == "ac" ? L("插电", "AC") : L("电池", "battery")
-            let how = st[0] == "auto" ? L("自动", "auto") : L("手动", "manual")
-            if pendingMode != nil && !applied { modeLine.title = L("CPU 模式：正在应用…", "CPU mode: applying…") }
-            else { modeLine.title = L("CPU 模式：EPP \(epp)（\(how) · \(src)）", "CPU mode: EPP \(epp) (\(how), \(src))") }
-            if pendingWrite?.isValid != true && pendingMode == nil { slider.doubleValue = Double(epp); sliderLabel.stringValue = sliderText(epp) }
-        } else { modeLine.title = L("CPU 模式：服务未运行", "CPU mode: service not running") }
+    func menuWillOpen(_ menu: NSMenu) { tick(); resize() }
+
+    func sliderRow(_ icon: String, _ s: NSSlider, _ value: NSTextField, _ action: Selector) -> NSView {
+        s.target = self; s.action = action; s.isContinuous = true; s.controlSize = .small
+        value.alignment = .right
+        value.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        return hstack([symbol(icon), s, value])
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        let menu = NSMenu()
-        menu.addItem(detail); menu.addItem(timeLine); menu.addItem(cpuLine); menu.addItem(.separator())
-        menu.addItem(modeLine)
-        for (i, p) in presets.enumerated() {
-            let it = NSMenuItem(title: L(p.zh, p.en), action: #selector(pickPreset(_:)), keyEquivalent: "")
-            it.target = self; it.tag = i; modeItems.append(it); menu.addItem(it)
-        }
-        let box = NSView(frame: NSRect(x: 0, y: 0, width: 330, height: 46))
-        sliderLabel.frame = NSRect(x: 20, y: 26, width: 290, height: 16)
-        sliderLabel.font = NSFont.menuFont(ofSize: 11); sliderLabel.textColor = .secondaryLabelColor; sliderLabel.alignment = .center
-        slider.frame = NSRect(x: 20, y: 4, width: 290, height: 22)
-        slider.target = self; slider.action = #selector(slid(_:)); slider.isContinuous = true
-        box.addSubview(sliderLabel); box.addSubview(slider)
-        let sl = NSMenuItem(); sl.view = box; menu.addItem(sl)
-        menu.addItem(.separator())
-        for (i, c) in gpuChoices.enumerated() {
-            let it = NSMenuItem(title: L(c.zh, c.en), action: #selector(pickGpu(_:)), keyEquivalent: "")
-            it.target = self; it.tag = i; gpuMenu.addItem(it)
-        }
-        gpuItem.submenu = gpuMenu; menu.addItem(gpuItem); menu.addItem(.separator())
-        let ebox = NSView(frame: NSRect(x: 0, y: 0, width: 330, height: 46))
-        extLabel.frame = NSRect(x: 20, y: 26, width: 290, height: 16)
-        extLabel.font = NSFont.menuFont(ofSize: 11); extLabel.textColor = .secondaryLabelColor; extLabel.alignment = .center
-        extSlider.frame = NSRect(x: 20, y: 4, width: 290, height: 22)
-        extSlider.target = self; extSlider.action = #selector(extSlid(_:)); extSlider.isContinuous = true
-        ebox.addSubview(extLabel); ebox.addSubview(extSlider)
-        extItem.view = ebox; extItem.isHidden = true; menu.addItem(extItem)
-        let vbox = NSView(frame: NSRect(x: 0, y: 0, width: 330, height: 46))
-        volLabel.frame = NSRect(x: 20, y: 26, width: 290, height: 16)
-        volLabel.font = NSFont.menuFont(ofSize: 11); volLabel.textColor = .secondaryLabelColor; volLabel.alignment = .center
-        volSlider.frame = NSRect(x: 20, y: 4, width: 290, height: 22)
-        volSlider.target = self; volSlider.action = #selector(volSlid(_:)); volSlider.isContinuous = true
-        vbox.addSubview(volLabel); vbox.addSubview(volSlider)
-        volItem.view = vbox; volItem.isHidden = true; menu.addItem(volItem)
-        lidItem.target = self; lidItem.action = #selector(toggleLid); lidItem.state = lidAwake() ? .on : .off
-        menu.addItem(lidItem); menu.addItem(.separator())
-        langItem.target = self; langItem.action = #selector(toggleLanguage)
-        menu.addItem(langItem); menu.addItem(quitItem)
+        // power card
+        let top = hstack([bigWatts, spacer(), battIcon])
+        let power = Card([top, battState, timeLine, cpuLine])
+        power.stack.setCustomSpacing(2, after: top); power.stack.setCustomSpacing(6, after: battState)
+        // processor card
+        modeSeg.target = self; modeSeg.action = #selector(pickPreset(_:)); modeSeg.segmentDistribution = .fillEqually; modeSeg.controlSize = .small
+        slider.target = self; slider.action = #selector(slid(_:)); slider.isContinuous = true; slider.controlSize = .small
+        sliderLeft.setContentHuggingPriority(.required, for: .horizontal); sliderRight.setContentHuggingPriority(.required, for: .horizontal)
+        let proc = Card([modeSeg, hstack([sliderLeft, slider, sliderRight]), modeLine])
+        // graphics card
+        gpuAuto.controlSize = .mini; gpuAuto.target = self; gpuAuto.action = #selector(gpuAutoToggled(_:))
+        gpuSlider.target = self; gpuSlider.action = #selector(gpuSlid(_:)); gpuSlider.isContinuous = true; gpuSlider.controlSize = .small
+        gpuSlider.numberOfTickMarks = 19; gpuSlider.allowsTickMarkValuesOnly = true
+        gpuValue.alignment = .right; gpuValue.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        let gfx = Card([hstack([gpuAutoLabel, spacer(), gpuAuto]), hstack([symbol("speedometer"), gpuSlider, gpuValue]), gpuLine])
+        // external display card
+        extRow = sliderRow("sun.max", extSlider, extValue, #selector(extSlid(_:)))
+        volRow = sliderRow("speaker.wave.2", volSlider, volValue, #selector(volSlid(_:)))
+        extCard = Card([extRow, volRow]); extCard.isHidden = true
+        // options card
+        lidSwitch.controlSize = .mini; lidSwitch.target = self; lidSwitch.action = #selector(toggleLid(_:))
+        for b in [langButton, quitButton] { b.bezelStyle = .rounded; b.controlSize = .small; b.target = self }
+        langButton.action = #selector(toggleLanguage); quitButton.action = #selector(quit)
+        let opts = Card([hstack([lidLabel, spacer(), lidSwitch]), hstack([langButton, spacer(), quitButton])])
+        cards = [power, proc, gfx, extCard, opts]
+
+        panel.orientation = .vertical; panel.alignment = .leading; panel.spacing = 8
+        panel.setHuggingPriority(.required, for: .vertical)
+        panel.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
+        for c in cards { panel.addArrangedSubview(c); c.widthAnchor.constraint(equalToConstant: width - 20).isActive = true }
+        panel.widthAnchor.constraint(equalToConstant: width).isActive = true
         relabel()
-        // one width for every state: the lines change length (a status line while a choice is applied, the estimate),
-        // and the menu must not resize under the pointer while the slider is dragged
-        menu.minimumWidth = 330
+
+        let menu = NSMenu(); menu.delegate = self
+        menu.addItem(panelItem)
         item.menu = menu
         item.button?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        tick()
-        // .common: the lines keep updating while the menu is open
+        tick(); resize()
+        // .common: the panel keeps updating while the menu is open
         let t = Timer(timeInterval: 2, repeats: true) { _ in self.tick() }
         RunLoop.main.add(t, forMode: .common)
     }
@@ -306,33 +370,57 @@ final class App: NSObject, NSApplicationDelegate {
             if abs(w) < 0.05 { title = b.external ? "⚡︎0W" : "0W" }
             else if w > 0 { title = String(format: "⚡︎+%.1fW", w) }
             else { title = String(format: "%.1fW", w) }
-            let state = w > 0.05 ? L("充电", "charging") : (w < -0.05 ? L("放电", "discharging") : L("未充放电", "idle"))
-            detail.title = String(format: L("电池 %@ %.1f W · %d%% · %@", "Battery %@ %.1f W · %d%% · %@"), state, abs(w), b.percent,
-                                  b.external ? L("已接电源", "on AC") : L("电池供电", "on battery"))
+            bigWatts.stringValue = abs(w) < 0.05 ? "0.0 W" : String(format: "%+.1f W", w)
+            bigWatts.textColor = w > 0.05 ? .systemGreen : (w < -0.05 ? .labelColor : .secondaryLabelColor)
+            let state = w > 0.05 ? L("充电", "Charging") : (w < -0.05 ? L("放电", "Discharging") : L("未充放电", "Idle"))
+            battState.stringValue = "\(state) · \(b.percent)% · " + (b.external ? L("已接电源", "on AC") : L("电池供电", "on battery"))
+            let level = b.percent >= 88 ? "100" : b.percent >= 63 ? "75" : b.percent >= 38 ? "50" : b.percent >= 13 ? "25" : "0"
+            let name = w > 0.05 || (b.external && b.percent >= 99) ? "battery.100.bolt" : "battery.\(level)"
+            battIcon.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 22, weight: .regular))
             // a new direction (plugged in / unplugged) starts the average again
             if let a = battAvg, (a > 0) == (w > 0) { battAvg = a * 0.93 + w * 0.07 } else { battAvg = w }
             func hm(_ h: Double) -> String { let m = Int((h * 60).rounded()); return m >= 60 ? L("\(m / 60) 小时 \(m % 60) 分", "\(m / 60) h \(m % 60) min") : L("\(m) 分钟", "\(m) min") }
             let avg = battAvg ?? w
-            if avg < -0.3, let left = b.whLeft { timeLine.title = L("预计还能用 ", "About ") + hm(left / -avg) + String(format: L(" · 剩 %.0f Wh · 均 %.1f W", " left · %.0f Wh · avg %.1f W"), left, -avg) }
-            else if avg > 0.3, let left = b.whLeft, let full = b.whFull, full > left { timeLine.title = L("预计 ", "Full in about ") + hm((full - left) / avg) + L(" 后充满", "") }
-            else if let m = b.minutes { timeLine.title = (b.external ? L("预计充满还需 ", "Full in about ") : L("预计还能用 ", "Time left: about ")) + hm(Double(m) / 60) }
-            else { timeLine.title = b.external ? L("已接电源", "On AC power") : L("预计时间：计算中", "Estimating time left…") }
-        } else { detail.title = L("读不到电池", "No battery data"); timeLine.title = "" }
+            if avg < -0.3, let left = b.whLeft { timeLine.stringValue = L("预计还能用 ", "About ") + hm(left / -avg) + String(format: L(" · 剩 %.0f Wh · 均 %.1f W", " left · %.0f Wh · avg %.1f W"), left, -avg) }
+            else if avg > 0.3, let left = b.whLeft, let full = b.whFull, full > left { timeLine.stringValue = L("预计 ", "Full in about ") + hm((full - left) / avg) + L(" 后充满", "") }
+            else if let m = b.minutes { timeLine.stringValue = (b.external ? L("预计充满还需 ", "Full in about ") : L("预计还能用 ", "Time left: about ")) + hm(Double(m) / 60) }
+            else { timeLine.stringValue = b.external ? L("已接电源", "On AC power") : L("预计时间：计算中", "Estimating time left…") }
+        } else { bigWatts.stringValue = "—"; battState.stringValue = L("读不到电池", "No battery data"); timeLine.stringValue = "" }
         if let c = cpu.read() {
             cpuAvg = cpuAvg.map { $0 * 0.6 + c.watts * 0.4 } ?? c.watts
-            cpuLine.title = String(format: L("CPU+核显 %.1f W · %.0f°C", "CPU + GPU %.1f W · %.0f°C"), cpuAvg!, c.temp)
-        } else { cpuLine.title = L("读不到 CPU 功耗", "No CPU power data") }
+            cpuLine.stringValue = String(format: L("CPU + 核显 %.1f W · %.0f°C", "CPU + GPU %.1f W · %.0f°C"), cpuAvg!, c.temp)
+        } else { cpuLine.stringValue = L("读不到 CPU 功耗", "No CPU power data") }
         item.button?.title = title
         refreshMode()
         refreshGpu()
         refreshExt()
         trackPanel()
-        lidItem.state = lidAwake() ? .on : .off
+        lidSwitch.state = lidAwake() ? .on : .off
     }
 }
 
 let app = NSApplication.shared
 let delegate = App()
+// powerbar --snapshot <file.png> [dark]: draw the panel once into a picture (for looking at the layout), with sample
+// values where this machine has none
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot" {
+    app.appearance = NSAppearance(named: CommandLine.arguments.count > 3 ? .darkAqua : .aqua)
+    delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+    delegate.extCard.isHidden = false; delegate.extRow.isHidden = false; delegate.volRow.isHidden = false
+    delegate.extValue.stringValue = "40%"; delegate.volValue.stringValue = "65%"; delegate.extSlider.doubleValue = 40; delegate.volSlider.doubleValue = 65
+    if delegate.modeLine.stringValue.count > 12 { delegate.modeLine.stringValue = "EPP 128 · " + L("自动", "auto") + " · " + L("插电", "AC"); delegate.modeSeg.selectedSegment = 0 }
+    delegate.gpuValue.stringValue = "1600 MHz"; delegate.gpuSlider.doubleValue = 1600; delegate.gpuAuto.state = .on
+    delegate.gpuLine.stringValue = L("当前上限 1600 MHz · 越高越流畅，也越耗电", "Cap now 1600 MHz · higher is smoother and draws more")
+    delegate.resize()
+    let v = delegate.panel
+    let win = NSWindow(contentRect: NSRect(origin: .zero, size: v.frame.size), styleMask: [.borderless], backing: .buffered, defer: false)
+    win.backgroundColor = .windowBackgroundColor; win.contentView = v; win.appearance = app.appearance
+    v.layoutSubtreeIfNeeded(); v.display()
+    let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
+    v.cacheDisplay(in: v.bounds, to: rep)
+    try? rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
+    exit(0)
+}
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()
