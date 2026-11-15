@@ -169,10 +169,10 @@ final class History {
         } else { try? "".write(toFile: path, atomically: true, encoding: .utf8) }
     }
     // a gap of more than five minutes between samples is sleep or power-off: it splits nothing but adds no awake time
-    func sessions() -> [Session] {
+    func sessions(from: Double = 0, to: Double = .infinity) -> [Session] {
         var out: [Session] = []
         var prev: Sample? = nil
-        for s in samples {
+        for s in samples where s.t >= from && s.t <= to {
             if out.isEmpty || out[out.count - 1].ext != s.ext {
                 out.append(Session(start: s.t, end: s.t, ext: s.ext, active: 0, pct0: s.pct, pct1: s.pct, wh0: s.wh, wh1: s.wh, wsum: 0, n: 0))
             } else if let p = prev, s.t - p.t <= 300 { out[out.count - 1].active += s.t - p.t }
@@ -212,6 +212,108 @@ final class HistoryChart: NSView {
             }
             prev = s
         }
+    }
+}
+
+// The records window's chart: any stretch of the history. Upper pane = charge in percent (green on AC, text colour on
+// battery, grey bands where the machine slept or was off), lower pane = power in watts (up = charging, down =
+// discharging). Moving the pointer over it reports the sample under it.
+final class RangeChart: NSView {
+    var samples: [Sample] = []
+    var t0 = 0.0, t1 = 1.0
+    var onHover: ((String) -> Void)?
+    private var hoverX: CGFloat? = nil
+    private var area: NSTrackingArea?
+    var plot: NSRect { NSRect(x: 44, y: 22, width: max(10, bounds.width - 56), height: max(10, bounds.height - 30)) }
+    var pctRect: NSRect { let p = plot; return NSRect(x: p.minX, y: p.minY + p.height * 0.36, width: p.width, height: p.height * 0.64) }
+    var wRect: NSRect { let p = plot; return NSRect(x: p.minX, y: p.minY, width: p.width, height: p.height * 0.28) }
+    func x(_ t: Double) -> CGFloat { plot.minX + CGFloat((t - t0) / max(1, t1 - t0)) * plot.width }
+    func visible() -> ArraySlice<Sample> {
+        var lo = 0, hi = samples.count
+        while lo < hi { let m = (lo + hi) / 2; if samples[m].t < t0 { lo = m + 1 } else { hi = m } }
+        var e = lo; while e < samples.count && samples[e].t <= t1 { e += 1 }
+        return samples[lo..<e]
+    }
+    override func updateTrackingAreas() {
+        if let a = area { removeTrackingArea(a) }
+        area = NSTrackingArea(rect: .zero, options: [.activeAlways, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(area!)
+    }
+    override func mouseMoved(with e: NSEvent) { hoverX = convert(e.locationInWindow, from: nil).x; needsDisplay = true }
+    override func mouseExited(with e: NSEvent) { hoverX = nil; needsDisplay = true; onHover?("") }
+    func text(_ s: String, at p: NSPoint, right: Bool = false, center: Bool = false) {
+        let a: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor]
+        let sz = (s as NSString).size(withAttributes: a)
+        (s as NSString).draw(at: NSPoint(x: right ? p.x - sz.width : center ? p.x - sz.width / 2 : p.x, y: p.y - sz.height / 2), withAttributes: a)
+    }
+    func hline(_ y: CGFloat, _ r: NSRect, alpha: CGFloat = 0.12) {
+        NSColor.labelColor.withAlphaComponent(alpha).setStroke()
+        let p = NSBezierPath(); p.move(to: NSPoint(x: r.minX, y: y)); p.line(to: NSPoint(x: r.maxX, y: y)); p.lineWidth = 1; p.stroke()
+    }
+    override func draw(_ dirty: NSRect) {
+        let pr = pctRect, wr = wRect, vis = visible(), span = max(1, t1 - t0)
+        for f in [0, 25, 50, 75, 100] { let y = pr.minY + pr.height * CGFloat(f) / 100; hline(y, pr); text("\(f)%", at: NSPoint(x: pr.minX - 5, y: y), right: true) }
+        var wmax = 10.0
+        for s in vis where abs(s.w) < 150 { wmax = max(wmax, abs(s.w)) }
+        wmax = (wmax / 10).rounded(.up) * 10
+        let wy = wr.midY
+        hline(wr.maxY, wr, alpha: 0.06); hline(wr.minY, wr, alpha: 0.06); hline(wy, wr, alpha: 0.2)
+        text("+\(Int(wmax))W", at: NSPoint(x: wr.minX - 5, y: wr.maxY), right: true); text("0", at: NSPoint(x: wr.minX - 5, y: wy), right: true)
+        text("−\(Int(wmax))W", at: NSPoint(x: wr.minX - 5, y: wr.minY), right: true)
+        // time ticks on local-time boundaries
+        let steps: [Double] = [600, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 432000, 864000]
+        let step = steps.first { span / $0 <= 8 } ?? 1728000
+        let off = Double(TimeZone.current.secondsFromGMT())
+        let f = DateFormatter(); f.dateFormat = step >= 86400 ? "MM-dd" : span > 86400 ? "MM-dd HH:mm" : "HH:mm"
+        var t = ((t0 + off) / step).rounded(.up) * step - off
+        while t <= t1 {
+            let xx = x(t)
+            NSColor.labelColor.withAlphaComponent(0.07).setStroke()
+            let p = NSBezierPath(); p.move(to: NSPoint(x: xx, y: wr.minY)); p.line(to: NSPoint(x: xx, y: pr.maxY)); p.lineWidth = 1; p.stroke()
+            text(f.string(from: Date(timeIntervalSince1970: t)), at: NSPoint(x: min(max(xx, plot.minX + 14), plot.maxX - 14), y: 9), center: true)
+            t += step
+        }
+        // the curves; points closer than 0.7 px to the last drawn one are skipped (60 days = 86 000 samples)
+        func py(_ s: Sample) -> CGFloat { pr.minY + CGFloat(s.pct) / 100 * pr.height }
+        var anchor: Sample? = nil, prev: Sample? = nil
+        for s in vis {
+            if let p = prev, s.t - p.t > 300 {
+                NSColor.labelColor.withAlphaComponent(0.05).setFill()
+                NSRect(x: x(p.t), y: pr.minY, width: x(s.t) - x(p.t), height: pr.height).fill()
+                anchor = nil
+            }
+            if let a = anchor {
+                if x(s.t) - x(a.t) >= 0.7 || s.ext != a.ext {
+                    let c = s.ext ? NSColor.systemGreen : NSColor.labelColor
+                    c.setStroke()
+                    let path = NSBezierPath(); path.move(to: NSPoint(x: x(a.t), y: py(a))); path.line(to: NSPoint(x: x(s.t), y: py(s)))
+                    path.lineWidth = 1.6; path.lineCapStyle = .round; path.stroke()
+                    if abs(s.w) < 150 {
+                        c.withAlphaComponent(0.55).setFill()
+                        let h = CGFloat(s.w / wmax) * wr.height / 2
+                        NSRect(x: x(a.t), y: min(wy, wy + h), width: max(1, x(s.t) - x(a.t)), height: abs(h)).fill()
+                    }
+                    anchor = s
+                }
+            } else { anchor = s }
+            prev = s
+        }
+        if vis.isEmpty { text(L("这段时间没有记录", "No records in this range"), at: NSPoint(x: pr.midX, y: pr.midY), center: true) }
+        // the sample under the pointer
+        guard let hx = hoverX, hx >= plot.minX, hx <= plot.maxX, !vis.isEmpty else { return }
+        let ht = t0 + Double((hx - plot.minX) / plot.width) * span
+        var best = vis.first!
+        var lo = vis.startIndex, hi = vis.endIndex
+        while lo < hi { let m = (lo + hi) / 2; if samples[m].t < ht { lo = m + 1 } else { hi = m } }
+        for i in [lo - 1, lo] where i >= vis.startIndex && i < vis.endIndex { if abs(samples[i].t - ht) < abs(best.t - ht) { best = samples[i] } }
+        guard abs(best.t - ht) <= max(300, span / Double(plot.width) * 6) else { onHover?(""); return }
+        let bx = x(best.t)
+        NSColor.labelColor.withAlphaComponent(0.35).setStroke()
+        let p = NSBezierPath(); p.move(to: NSPoint(x: bx, y: wr.minY)); p.line(to: NSPoint(x: bx, y: pr.maxY)); p.lineWidth = 1; p.stroke()
+        (best.ext ? NSColor.systemGreen : NSColor.labelColor).setFill()
+        NSBezierPath(ovalIn: NSRect(x: bx - 3.5, y: py(best) - 3.5, width: 7, height: 7)).fill()
+        let df = DateFormatter(); df.dateFormat = "MM-dd HH:mm"
+        onHover?(df.string(from: Date(timeIntervalSince1970: best.t)) + " · \(best.pct)% · " + (best.ext ? L("接电", "on AC") : L("用电池", "on battery")) + String(format: " %+.1f W", best.w))
     }
 }
 
@@ -283,6 +385,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func refreshHistory(whLeft: Double?, whFull: Double?, external: Bool) {
         chart.samples = history.samples; chart.needsDisplay = true
+        if recordsWindow?.isVisible == true { refreshRecords() }
         if let cur = history.sessions().last {
             sessionLine.stringValue = (cur.ext ? L("本次接电已 ", "On AC for ") : L("本次用电池已 ", "On battery for ")) + hm(cur.active) + " · \(cur.pct0)% → \(cur.pct1)%"
         } else { sessionLine.stringValue = L("还没有记录", "No records yet") }
@@ -293,17 +396,74 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if external { historyLine.stringValue = L("已接电源", "On AC power") }
         else { historyLine.stringValue = L("历史记录不足，用电池满半小时后给出估计", "Estimate after half an hour on battery") }
     }
+    // ---- the records window: a chart of any stretch of the history, a summary of it and its sessions ----------------
+    let rangeSeg = NSSegmentedControl(labels: ["", "", "", "", "", "", ""], trackingMode: .selectOne, target: nil, action: nil)
+    let rangeSpans: [Double] = [6 * 3600, 86400, 3 * 86400, 7 * 86400, 30 * 86400]      // then "all" and "custom"
+    let fromPicker = NSDatePicker(), toPicker = NSDatePicker()
+    let rangeChart = RangeChart()
+    let rangeSummary = label(size: 12), rangeHover = label(size: 12, color: .secondaryLabelColor, mono: true)
+    let recordsText = NSTextView()
+    var recordsCount = -1
+    func buildRecords() -> NSWindow {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 600), styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false; w.minSize = NSSize(width: 640, height: 460)
+        rangeSeg.target = self; rangeSeg.action = #selector(rangePicked); rangeSeg.selectedSegment = 1; rangeSeg.controlSize = .small
+        for p in [fromPicker, toPicker] {
+            p.datePickerStyle = .textFieldAndStepper; p.datePickerElements = [.yearMonthDay, .hourMinute]; p.controlSize = .small
+            p.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular); p.target = self; p.action = #selector(rangeTyped)
+        }
+        rangeChart.onHover = { [weak self] s in self?.rangeHover.stringValue = s.isEmpty ? L("把指针移到曲线上查看某一刻的电量和功率", "Move the pointer over the chart for the reading at that moment") : s }
+        rangeChart.onHover?("")
+        let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.drawsBackground = false; scroll.borderType = .noBorder
+        recordsText.isEditable = false; recordsText.drawsBackground = false; recordsText.autoresizingMask = [.width]
+        recordsText.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular); recordsText.textContainerInset = NSSize(width: 2, height: 4)
+        scroll.documentView = recordsText
+        let top = hstack([rangeSeg, spacer(), fromPicker, label("–", color: .secondaryLabelColor), toPicker])
+        let stack = NSStackView(views: [top, rangeSummary, rangeChart, rangeHover, scroll])
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 16, bottom: 12, right: 16)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let root = NSView(); root.addSubview(stack); w.contentView = root
+        NSLayoutConstraint.activate([stack.topAnchor.constraint(equalTo: root.topAnchor), stack.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+                                     stack.leadingAnchor.constraint(equalTo: root.leadingAnchor), stack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+                                     rangeChart.heightAnchor.constraint(greaterThanOrEqualToConstant: 240), scroll.heightAnchor.constraint(equalToConstant: 150)])
+        for v in stack.arrangedSubviews { v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true }
+        rangeChart.setContentHuggingPriority(.init(1), for: .vertical)
+        return w
+    }
+    @objc func rangePicked() { recordsCount = -1; refreshRecords() }
+    @objc func rangeTyped() { rangeSeg.selectedSegment = 6; recordsCount = -1; refreshRecords() }
+    func refreshRecords() {
+        guard let w = recordsWindow else { return }
+        w.title = L("充放电记录", "Charge and discharge records")
+        let names = [L("6 小时", "6 h"), L("24 小时", "24 h"), L("3 天", "3 d"), L("7 天", "7 d"), L("30 天", "30 d"), L("全部", "All"), L("自选", "Custom")]
+        for (i, n) in names.enumerated() { rangeSeg.setLabel(n, forSegment: i) }
+        let now = Date().timeIntervalSince1970, i = rangeSeg.selectedSegment
+        var t0 = now - 86400, t1 = now
+        if i >= 0 && i < rangeSpans.count { t0 = now - rangeSpans[i] }
+        else if i == 5 { t0 = min(history.samples.first?.t ?? now - 3600, now - 600) }
+        else { t0 = fromPicker.dateValue.timeIntervalSince1970; t1 = toPicker.dateValue.timeIntervalSince1970; if t1 < t0 + 600 { t1 = t0 + 600 } }
+        if i != 6 { fromPicker.dateValue = Date(timeIntervalSince1970: t0); toPicker.dateValue = Date(timeIntervalSince1970: t1) }
+        rangeChart.samples = history.samples; rangeChart.t0 = t0; rangeChart.t1 = t1; rangeChart.needsDisplay = true
+        guard recordsCount != history.samples.count else { return }      // the texts only when there is something new
+        recordsCount = history.samples.count
+        let ses = history.sessions(from: t0, to: t1)
+        var batt = 0.0, ac = 0.0, bw = 0.0, bn = 0, cw = 0.0, cn = 0
+        for s in ses { if s.ext { ac += s.active; cw += s.wsum; cn += s.n } else { batt += s.active; bw += s.wsum; bn += s.n } }
+        if let a = ses.first, let b = ses.last {
+            let asleep = max(0, b.end - a.start - batt - ac)
+            rangeSummary.stringValue = L("这段时间：用电池 ", "In this range: on battery ") + hm(batt) + (bn > 0 && batt >= 60 ? String(format: L("（均 %.1f W）", " (avg %.1f W)"), abs(bw / Double(bn))) : "")
+                + L(" · 接电 ", " · on AC ") + hm(ac) + (cn > 0 && ac >= 60 ? String(format: L("（均 %.1f W）", " (avg %.1f W)"), abs(cw / Double(cn))) : "")
+                + L(" · 休眠或关机 ", " · asleep or off ") + hm(asleep) + L("（灰色段）", " (grey bands)")
+        } else { rangeSummary.stringValue = L("这段时间没有记录", "No records in this range") }
+        let rows = ses.reversed().filter { $0.active >= 60 }.prefix(300)
+        recordsText.string = rows.isEmpty ? L("没有满一分钟的充放电记录", "No session of a minute or more") : rows.map { describe($0, long: true) }.joined(separator: "\n")
+        recordsText.textColor = .labelColor
+    }
     @objc func showRecords() {
-        let all = history.sessions().reversed().filter { $0.active >= 60 }.prefix(80)
-        let text = all.isEmpty ? L("还没有记录", "No records yet") : all.map { describe($0, long: true) }.joined(separator: "\n")
-        let w = recordsWindow ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 420), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        w.title = L("充放电记录（时长为机器实际运行的时间，不含休眠）", "Charge and discharge records (time the machine was awake)")
-        w.isReleasedWhenClosed = false
-        let scroll = NSScrollView(frame: w.contentView!.bounds); scroll.autoresizingMask = [.width, .height]; scroll.hasVerticalScroller = true
-        let tv = NSTextView(frame: scroll.bounds); tv.isEditable = false; tv.autoresizingMask = [.width]
-        tv.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular); tv.textContainerInset = NSSize(width: 10, height: 10); tv.string = text
-        scroll.documentView = tv; w.contentView = scroll
-        recordsWindow = w; w.center(); NSApp.activate(ignoringOtherApps: true); w.makeKeyAndOrderFront(nil)
+        if recordsWindow == nil { recordsWindow = buildRecords(); recordsWindow!.center() }
+        recordsCount = -1; refreshRecords()
+        NSApp.activate(ignoringOtherApps: true); recordsWindow!.makeKeyAndOrderFront(nil)
         item.menu?.cancelTracking()
     }
     let width: CGFloat = 340
@@ -502,7 +662,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func relabel() {
         let caps = [L("电源", "POWER"), L("电量记录 · 近 12 小时", "CHARGE HISTORY · LAST 12 HOURS"), L("处理器", "PROCESSOR"), L("核显", "GRAPHICS"), L("外接显示器", "EXTERNAL DISPLAY"), L("选项", "OPTIONS")]
         axisL.stringValue = L("12 小时前", "12 h ago"); axisM.stringValue = L("绿色 = 接电", "green = on AC"); axisR.stringValue = L("现在", "now")
-        recordsButton.title = L("查看全部记录…", "All records…")
+        recordsButton.title = L("记录曲线与明细…", "Chart and records…"); recordsCount = -1; refreshRecords()
         for (i, c) in cards.enumerated() { c.caption.stringValue = caps[i] }
         for (i, p) in presets.enumerated() { modeSeg.setLabel(L(p.zh, p.en), forSegment: i) }
         sliderLeft.stringValue = L("性能", "Performance"); sliderRight.stringValue = L("省电", "Saver")
@@ -643,6 +803,26 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot" {
     let win = NSWindow(contentRect: NSRect(origin: .zero, size: v.frame.size), styleMask: [.borderless], backing: .buffered, defer: false)
     win.backgroundColor = .windowBackgroundColor; win.contentView = v; win.appearance = app.appearance
     v.layoutSubtreeIfNeeded(); v.display()
+    let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
+    v.cacheDisplay(in: v.bounds, to: rep)
+    try? rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
+    exit(0)
+}
+// powerbar --snapshot-records <file.png> [dark] [segment]: the records window with three made-up days
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot-records" {
+    app.appearance = NSAppearance(named: CommandLine.arguments.count > 3 && CommandLine.arguments[3] == "dark" ? .darkAqua : .aqua)
+    var smp: [Sample] = []; let now = Date().timeIntervalSince1970; var pct = 80.0
+    for i in stride(from: 4320, to: 0, by: -1) {
+        let c = i % 700
+        if c > 300 { pct = max(5, pct - 0.2) } else if c > 220 { continue } else { pct = min(100, pct + 0.5) }
+        let ac = c <= 220
+        smp.append(Sample(t: now - Double(i) * 60, pct: Int(pct), wh: pct * 0.99, w: ac ? (pct >= 100 ? 0 : 48 - pct * 0.3) : -14 - Double(i % 37) * 0.4, ext: ac))
+    }
+    delegate.history.samples = smp
+    let w = delegate.buildRecords(); delegate.recordsWindow = w
+    if CommandLine.arguments.count > 4, let n = Int(CommandLine.arguments[4]) { delegate.rangeSeg.selectedSegment = n }
+    w.appearance = app.appearance; delegate.refreshRecords()
+    let v = w.contentView!; v.layoutSubtreeIfNeeded(); v.display()
     let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
     v.cacheDisplay(in: v.bounds, to: rep)
     try? rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
