@@ -130,6 +130,91 @@ final class TCCPrompter {
     }
 }
 
+// ---- energy history ----------------------------------------------------------------------------------------------
+// One sample a minute (time, charge %, Wh left, average watts, on AC) in ~/Library/Application Support/powerbar/
+// history.csv, 60 days kept. From it: sessions (the stretch between two changes of the power source, with the time the
+// machine was actually awake in it), the chart of the last 12 hours, and the usual discharge power for the estimate.
+struct Sample { let t: Double; let pct: Int; let wh: Double; let w: Double; let ext: Bool }
+struct Session { var start: Double, end: Double; var ext: Bool; var active: Double; var pct0: Int, pct1: Int; var wh0: Double, wh1: Double; var wsum: Double; var n: Int
+    var avgW: Double { n > 0 ? wsum / Double(n) : 0 } }
+final class History {
+    var samples: [Sample] = []
+    let path: String
+    var accW = 0.0, accN = 0, lastWrite = 0.0, lastExt: Bool? = nil
+    init() {
+        let dir = NSHomeDirectory() + "/Library/Application Support/powerbar"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        path = dir + "/history.csv"
+        let cut = Date().timeIntervalSince1970 - 60 * 86400
+        for line in ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "").split(separator: "\n") {
+            let f = line.split(separator: ",")
+            if f.count >= 5, let t = Double(f[0]), t > cut, let p = Int(f[1]), let wh = Double(f[2]), let w = Double(f[3]) { samples.append(Sample(t: t, pct: p, wh: wh, w: w, ext: f[4] == "1")) }
+        }
+        // rewrite without the lines that fell out of the window
+        try? samples.map { "\(Int($0.t)),\($0.pct),\(String(format: "%.2f", $0.wh)),\(String(format: "%.2f", $0.w)),\($0.ext ? 1 : 0)" }.joined(separator: "\n").appending(samples.isEmpty ? "" : "\n")
+            .write(toFile: path, atomically: true, encoding: .utf8)
+    }
+    // called every tick with the current reading; writes a sample once a minute, and at once when the power source changes
+    func add(pct: Int, wh: Double?, w: Double, ext: Bool) {
+        accW += w; accN += 1
+        let now = Date().timeIntervalSince1970
+        guard now - lastWrite >= 60 || (lastExt != nil && lastExt != ext) else { return }
+        let smp = Sample(t: now, pct: pct, wh: wh ?? 0, w: accW / Double(accN), ext: ext)
+        accW = 0; accN = 0; lastWrite = now; lastExt = ext
+        samples.append(smp)
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile()
+            h.write("\(Int(smp.t)),\(smp.pct),\(String(format: "%.2f", smp.wh)),\(String(format: "%.2f", smp.w)),\(smp.ext ? 1 : 0)\n".data(using: .utf8)!)
+            h.closeFile()
+        } else { try? "".write(toFile: path, atomically: true, encoding: .utf8) }
+    }
+    // a gap of more than five minutes between samples is sleep or power-off: it splits nothing but adds no awake time
+    func sessions() -> [Session] {
+        var out: [Session] = []
+        var prev: Sample? = nil
+        for s in samples {
+            if out.isEmpty || out[out.count - 1].ext != s.ext {
+                out.append(Session(start: s.t, end: s.t, ext: s.ext, active: 0, pct0: s.pct, pct1: s.pct, wh0: s.wh, wh1: s.wh, wsum: 0, n: 0))
+            } else if let p = prev, s.t - p.t <= 300 { out[out.count - 1].active += s.t - p.t }
+            out[out.count - 1].end = s.t; out[out.count - 1].pct1 = s.pct; out[out.count - 1].wh1 = s.wh
+            if abs(s.w) < 150 { out[out.count - 1].wsum += s.w; out[out.count - 1].n += 1 }
+            prev = s
+        }
+        return out
+    }
+    // The usual power on battery (positive watts) or while charging, over the last 14 days: samples between the 10th and
+    // the 90th percentile only, so a stuck gauge, a sample taken across a wake or a short burst do not move it.
+    func typicalWatts(charging: Bool) -> (watts: Double, minutes: Int)? {
+        let cut = Date().timeIntervalSince1970 - 14 * 86400
+        var v = samples.filter { $0.t > cut && $0.ext == charging && abs($0.w) < 150 && (charging ? $0.w > 1 : $0.w < -1) }.map { abs($0.w) }
+        guard v.count >= 30 else { return nil }
+        v.sort()
+        let lo = v.count / 10, hi = v.count - v.count / 10
+        let mid = v[lo..<hi]
+        return (mid.reduce(0, +) / Double(mid.count), v.count)
+    }
+}
+// battery charge over the last 12 hours: green while on AC, the text colour on battery; breaks where the machine slept
+final class HistoryChart: NSView {
+    var samples: [Sample] = []
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 64) }
+    override func draw(_ dirty: NSRect) {
+        let r = bounds.insetBy(dx: 1, dy: 3)
+        NSColor.labelColor.withAlphaComponent(0.12).setStroke()
+        for f in [0.0, 0.5, 1.0] { let y = r.minY + r.height * f; let p = NSBezierPath(); p.move(to: NSPoint(x: r.minX, y: y)); p.line(to: NSPoint(x: r.maxX, y: y)); p.lineWidth = 1; p.stroke() }
+        let now = Date().timeIntervalSince1970, span = 12.0 * 3600
+        func pt(_ s: Sample) -> NSPoint { NSPoint(x: r.maxX - CGFloat((now - s.t) / span) * r.width, y: r.minY + CGFloat(s.pct) / 100 * r.height) }
+        var prev: Sample? = nil
+        for s in samples where now - s.t <= span {
+            if let p = prev, s.t - p.t <= 300 {
+                (s.ext ? NSColor.systemGreen : NSColor.labelColor).setStroke()
+                let path = NSBezierPath(); path.move(to: pt(p)); path.line(to: pt(s)); path.lineWidth = 1.6; path.lineCapStyle = .round; path.stroke()
+            }
+            prev = s
+        }
+    }
+}
+
 // ---- small view helpers ------------------------------------------------------------------------------------------
 func label(_ s: String = "", size: CGFloat = 13, weight: NSFont.Weight = .regular, color: NSColor = .labelColor, mono: Bool = false) -> NSTextField {
     let t = NSTextField(labelWithString: s)
@@ -183,6 +268,44 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let cpu = CPUPower()
     let tcc = TCCPrompter()
+    let history = History()
+    let chart = HistoryChart()
+    let axisL = label(size: 10, color: .tertiaryLabelColor), axisM = label(size: 10, color: .tertiaryLabelColor), axisR = label(size: 10, color: .tertiaryLabelColor)
+    let sessionLine = label(size: 12), historyLine = label(size: 12, color: .secondaryLabelColor)
+    let recordsButton = NSButton(title: "", target: nil, action: nil)
+    var recordsWindow: NSWindow?
+    func hm(_ secs: Double) -> String { let m = Int((secs / 60).rounded()); return m >= 60 ? L("\(m / 60) 小时 \(m % 60) 分", "\(m / 60) h \(m % 60) min") : L("\(m) 分钟", "\(m) min") }
+    func describe(_ s: Session, long: Bool) -> String {
+        let f = DateFormatter(); f.dateFormat = long ? "MM-dd HH:mm" : "HH:mm"
+        let kind = s.ext ? L("接电", "On AC   ") : L("电池", "Battery ")
+        let w = abs(s.avgW) >= 0.05 ? String(format: L(" · 均 %.1f W", " · avg %.1f W"), abs(s.avgW)) : ""
+        return "\(kind) \(f.string(from: Date(timeIntervalSince1970: s.start)))–\(f.string(from: Date(timeIntervalSince1970: s.end))) · " + hm(s.active) + " · \(s.pct0)% → \(s.pct1)%" + w
+    }
+    func refreshHistory(whLeft: Double?, whFull: Double?, external: Bool) {
+        chart.samples = history.samples; chart.needsDisplay = true
+        if let cur = history.sessions().last {
+            sessionLine.stringValue = (cur.ext ? L("本次接电已 ", "On AC for ") : L("本次用电池已 ", "On battery for ")) + hm(cur.active) + " · \(cur.pct0)% → \(cur.pct1)%"
+        } else { sessionLine.stringValue = L("还没有记录", "No records yet") }
+        if !external, let t = history.typicalWatts(charging: false), let left = whLeft {
+            historyLine.stringValue = L("按历史用量还能用约 ", "At the usual rate: about ") + hm(left / t.watts * 3600) + String(format: L("（%.1f W）", " (%.1f W)"), t.watts)
+        } else if external, let t = history.typicalWatts(charging: true), let left = whLeft, let full = whFull, full - left > 0.5 {
+            historyLine.stringValue = L("按历史充电速度约 ", "At the usual rate: about ") + hm((full - left) / t.watts * 3600) + L(" 充满", " to full") + String(format: L("（%.0f W）", " (%.0f W)"), t.watts)
+        } else if external { historyLine.stringValue = L("已接电源", "On AC power") }
+        else { historyLine.stringValue = L("历史记录不足，用电池满半小时后给出估计", "Estimate after half an hour on battery") }
+    }
+    @objc func showRecords() {
+        let all = history.sessions().reversed().filter { $0.active >= 60 }.prefix(80)
+        let text = all.isEmpty ? L("还没有记录", "No records yet") : all.map { describe($0, long: true) }.joined(separator: "\n")
+        let w = recordsWindow ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 420), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        w.title = L("充放电记录（时长为机器实际运行的时间，不含休眠）", "Charge and discharge records (time the machine was awake)")
+        w.isReleasedWhenClosed = false
+        let scroll = NSScrollView(frame: w.contentView!.bounds); scroll.autoresizingMask = [.width, .height]; scroll.hasVerticalScroller = true
+        let tv = NSTextView(frame: scroll.bounds); tv.isEditable = false; tv.autoresizingMask = [.width]
+        tv.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular); tv.textContainerInset = NSSize(width: 10, height: 10); tv.string = text
+        scroll.documentView = tv; w.contentView = scroll
+        recordsWindow = w; w.center(); NSApp.activate(ignoringOtherApps: true); w.makeKeyAndOrderFront(nil)
+        item.menu?.cancelTracking()
+    }
     let width: CGFloat = 340
     var lastWatts: Double = 0
     var battAvg: Double? = nil      // battery watts averaged over about a minute: the estimate should not jump
@@ -377,7 +500,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc func quit() { NSApp.terminate(nil) }
     func relabel() {
-        let caps = [L("电源", "POWER"), L("处理器", "PROCESSOR"), L("核显", "GRAPHICS"), L("外接显示器", "EXTERNAL DISPLAY"), L("选项", "OPTIONS")]
+        let caps = [L("电源", "POWER"), L("电量记录 · 近 12 小时", "CHARGE HISTORY · LAST 12 HOURS"), L("处理器", "PROCESSOR"), L("核显", "GRAPHICS"), L("外接显示器", "EXTERNAL DISPLAY"), L("选项", "OPTIONS")]
+        axisL.stringValue = L("12 小时前", "12 h ago"); axisM.stringValue = L("绿色 = 接电", "green = on AC"); axisR.stringValue = L("现在", "now")
+        recordsButton.title = L("查看全部记录…", "All records…")
         for (i, c) in cards.enumerated() { c.caption.stringValue = caps[i] }
         for (i, p) in presets.enumerated() { modeSeg.setLabel(L(p.zh, p.en), forSegment: i) }
         sliderLeft.stringValue = L("性能", "Performance"); sliderRight.stringValue = L("省电", "Saver")
@@ -426,7 +551,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for b in [langButton, quitButton] { b.bezelStyle = .rounded; b.controlSize = .small; b.target = self }
         langButton.action = #selector(toggleLanguage); quitButton.action = #selector(quit)
         let opts = Card([hstack([lidLabel, spacer(), lidSwitch]), hstack([langButton, spacer(), quitButton])])
-        cards = [power, proc, gfx, extCard, opts]
+        recordsButton.bezelStyle = .rounded; recordsButton.controlSize = .small; recordsButton.target = self; recordsButton.action = #selector(showRecords)
+        let axis = hstack([axisL, spacer(), axisM, spacer(), axisR])
+        let hist = Card([chart, axis, sessionLine, historyLine, hstack([spacer(), recordsButton])])
+        hist.stack.setCustomSpacing(2, after: chart)
+        cards = [power, hist, proc, gfx, extCard, opts]
 
         panel.orientation = .vertical; panel.alignment = .leading; panel.spacing = 8
         panel.setHuggingPriority(.required, for: .vertical)
@@ -471,6 +600,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else if avg > 0.3, let left = b.whLeft, let full = b.whFull, full > left { timeLine.stringValue = L("预计 ", "Full in about ") + hm((full - left) / avg) + L(" 后充满", "") }
             else if let m = b.minutes { timeLine.stringValue = (b.external ? L("预计充满还需 ", "Full in about ") : L("预计还能用 ", "Time left: about ")) + hm(Double(m) / 60) }
             else { timeLine.stringValue = b.external ? L("已接电源", "On AC power") : L("预计时间：计算中", "Estimating time left…") }
+            history.add(pct: b.percent, wh: b.whLeft, w: w, ext: b.external)
+            refreshHistory(whLeft: b.whLeft, whFull: b.whFull, external: b.external)
         } else { bigWatts.stringValue = "—"; battState.stringValue = L("读不到电池", "No battery data"); timeLine.stringValue = "" }
         if let c = cpu.read() {
             cpuAvg = cpuAvg.map { $0 * 0.6 + c.watts * 0.4 } ?? c.watts
@@ -497,6 +628,16 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot" {
     if delegate.modeLine.stringValue.count > 12 { delegate.modeLine.stringValue = "EPP 128 · " + L("自动", "auto") + " · " + L("插电", "AC"); delegate.modeSeg.selectedSegment = 0 }
     delegate.gpuValue.stringValue = "1600 MHz"; delegate.gpuSlider.doubleValue = 1600; delegate.gpuAuto.state = .on
     delegate.gpuLine.stringValue = L("当前上限 1600 MHz · 越高越流畅，也越耗电", "Cap now 1600 MHz · higher is smoother and draws more")
+    if delegate.history.samples.count < 30 {      // a made-up day for the picture
+        var smp: [Sample] = []; let now = Date().timeIntervalSince1970; var pct = 96.0
+        for i in stride(from: 700, to: 0, by: -1) {
+            let t = now - Double(i) * 60
+            if i > 520 { pct -= 0.25 } else if i > 430 { continue } else if i > 330 { pct = min(100, pct + 0.6) } else { pct -= 0.2 }
+            smp.append(Sample(t: t, pct: Int(pct), wh: pct * 0.99, w: i > 330 && i <= 430 ? 45 : -19, ext: i > 330 && i <= 430))
+        }
+        delegate.history.samples = smp
+        delegate.refreshHistory(whLeft: 30, whFull: 99, external: false)
+    }
     delegate.resize()
     let v = delegate.panel
     let win = NSWindow(contentRect: NSRect(origin: .zero, size: v.frame.size), styleMask: [.borderless], backing: .buffered, defer: false)
