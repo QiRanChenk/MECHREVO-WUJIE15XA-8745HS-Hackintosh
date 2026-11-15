@@ -95,9 +95,9 @@ tools/hdmi/          HDMI 外接显示器：点亮 HDMI 口、热插拔、按 ED
 
 注意：唤醒需要按电源键；不要带 `-v` / `debug=0x100` 测试休眠（入睡时会卡死）；一次失败的睡眠可能让 MT7922 无线网卡失灵，需彻底断电（关机、拔电源、长按电源键 20 秒）才能恢复。
 
-## 外接显示器（HDMI）
+## 外接显示器（HDMI 口 / USB-C 口）
 
-nullarc 0.4.0 只驱动内屏。这里让机身 HDMI 口成为 macOS 里真正的第二块屏（扩展桌面、热插拔、显示器休眠、合盖外接）。USB-C 输出没有做。
+nullarc 0.4.0 只驱动内屏。这里让机身 HDMI 口和 USB-C 口（DP 交替模式，例如 USB-C 转 HDMI 转接器）成为 macOS 里真正的第二块屏（扩展桌面、热插拔、显示器休眠、合盖外接）。两个口共用显示管线 1，同一时间只能点亮其中一个。
 
 组成：
 
@@ -112,6 +112,8 @@ HDMI 声音：`hdmimode.py` 按 EDID 写好 HDMI 口的音频端点（显示器�
 两块 2.5K 屏在 800 MHz 的核显限频下会卡，`cppcd` 在外接屏点亮时把上限提到 1600 MHz，拔掉后回到 800；也可以在 powerbar 的"核显频率上限"里手动选 800～2600 MHz。
 
 安装：把 linux-firmware 的 `amdgpu/dcn_3_1_4_dmcub.bin` 和本机的 `vbios.bin`（Linux 下 `/sys/kernel/debug/dri/0/amdgpu_vbios`）放进 `tools/hdmi/`，然后 `sudo tools/hdmi/install.sh`。需要 boot-arg `phxdebug=1` 和带"不回读写寄存器"的 PhxBringup（同一 fork 的 `test14` 分支起）。
+
+USB-C 口（DisplayPort）：Type-C 侧由 EC/PD 固件自己进入 DP 交替模式，显卡只看到热插拔（0x53e4）和 AUX。`dmubboot` 自己做 AUX（DP_AUX2 软件引擎：DPCD、I2C-over-AUX 读 EDID、DDC/CI）和 DP 1.2 链路训练（`dptrain`：TPS1 时钟恢复、TPS3/TPS2 均衡、按 sink 的请求调驱动、失败降速）；PHY 仍由 DMUB 固件通过 DIG1_TRANSMITTER_CONTROL（UNIPHY_C）编程。像素时钟走 DP DTO，不用 SET_PIXEL_CLOCK。像素时钟上限由训练出的链路决定（2 通道 HBR2 约 349 MHz）。实测 2 通道 HBR2 一次训练通过（VS0/PE0），调整和降速路径没有实测过。
 
 几个值得记下的坑：
 
@@ -161,4 +163,4 @@ Source patches for the modified GPL/BSD kexts are in `patches/`.
 
 ### External display (HDMI)
 
-The HDMI port works as a real second display (extended desktop, hot-plug, display sleep, clamshell). It needs the `hdmi-fb2` branch of [QiRanChenk/nullarc](https://github.com/QiRanChenk/nullarc) (PhxAccel with a second framebuffer, boot-arg `phxfb2=1`) and `tools/hdmi` (a root daemon that loads Linux's DMUB firmware, programs display pipe 1 from the monitor's EDID and reports the mode to the framebuffer). Limits: 8 bpc RGB, pixel clock up to 340 MHz, HDMI audio through VoodooHDA restricted to the Radeon audio function, tested on this DCN 3.1.4 machine with two monitors only. See the Chinese section above for the details and pitfalls.
+The HDMI port and DisplayPort on the USB-C port (DP alt mode, one of them at a time) work as a real second display (extended desktop, hot-plug, display sleep, clamshell). It needs the `hdmi-fb2` branch of [QiRanChenk/nullarc](https://github.com/QiRanChenk/nullarc) (PhxAccel with a second framebuffer, boot-arg `phxfb2=1`) and `tools/hdmi` (a root daemon that loads Linux's DMUB firmware, programs display pipe 1 from the monitor's EDID and reports the mode to the framebuffer). Limits: 8 bpc RGB, pixel clock up to 340 MHz, HDMI audio through VoodooHDA restricted to the Radeon audio function, tested on this DCN 3.1.4 machine with two monitors only. See the Chinese section above for the details and pitfalls.

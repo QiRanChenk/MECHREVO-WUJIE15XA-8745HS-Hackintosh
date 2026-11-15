@@ -50,7 +50,7 @@ def pick(e, want):      # want: (width, height, refresh or None)
 # every enable: what the sink can play (from the EDID's CTA block) and its name, for the HD-audio codec's ELD. Without
 # it the codec reports no monitor. Returns the plan lines for before the link comes up and for after, or None when the
 # EDID announces no audio.
-def audio_endpoint(e):
+def audio_endpoint(e, dp=False):
     sad = None; spk = 1; basic = False
     for b in range(1, len(e) // 128):
         x = e[b * 128:(b + 1) * 128]
@@ -70,10 +70,11 @@ def audio_endpoint(e):
     for o in range(54, 126, 18):
         if e[o:o + 3] == b'\0\0\0' and e[o + 3] == 0xfc: name = e[o + 5:o + 18].split(b'\n')[0].rstrip()
     name = name[:16]
-    w = lambda idx, val, note='': ['w 384c %x AZF0ENDPOINT1_INDEX' % idx, 'w 384d %x AZF0ENDPOINT1_DATA %s' % (val, note)]
-    pre = ['# audio endpoint 1: sink capabilities and name (from the EDID)']
+    ir = 0x3852 if dp else 0x384c       # the HDMI port's encoder uses endpoint 1, the USB-C DP one endpoint 2
+    w = lambda idx, val, note='': ['w %x %x AZF0ENDPOINT_INDEX' % (ir, idx), 'w %x %x AZF0ENDPOINT_DATA %s' % (ir + 1, val, note)]
+    pre = ['# audio endpoint %d: sink capabilities and name (from the EDID)' % (2 if dp else 1)]
     for v in (0x80000001, 1, 0, 1): pre += w(0x54, v, 'hot plug control')
-    pre += w(0x25, 0x10000 | spk, 'speaker allocation, HDMI') + w(0x27, 0)
+    pre += w(0x25, (0x20000 if dp else 0x10000) | spk, 'speaker allocation, ' + ('DP' if dp else 'HDMI')) + w(0x27, 0)
     pre += w(0x28, (sad[0] & 7) | sad[1] << 8 | sad[2] << 16 | sad[1] << 24, 'LPCM: channels - 1, rates, sample sizes')
     for idx in (0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x31, 0x32, 0x33, 0x35): pre += w(idx, 0)
     pre += w(0x38, 1) + w(0x37, 0) + w(0x37, 0)
@@ -81,10 +82,10 @@ def audio_endpoint(e):
     pre += w(0x3c, 0x5558859e, 'port id') + w(0x3d, 0x0d989449)
     padded = name + bytes(20 - len(name))
     for k in range(5): pre += w(0x3e + k, int.from_bytes(padded[k * 4:k * 4 + 4], 'little'), 'name')
-    post = ['# audio endpoint 1 on (after the link is up)'] + w(0x54, 0x10) + w(0x54, 0x80000001) + w(0x54, 0x80000000)
+    post = ['# audio endpoint on (after the link is up)'] + w(0x54, 0x10) + w(0x54, 0x80000001) + w(0x54, 0x80000000)
     return pre, post
 
-def gen(m, outdir, edid=b''):
+def gen(m, outdir, edid=b'', dp=None):
     captured = not os.environ.get('HDMIMODE_FORCE') and (m['pclk'], m['ha'], m['va'], m['ht'], m['vt'], m['hss'], m['hse'], m['vss'], m['vse']) == (244800, 2560, 1440, 2720, 1500, 2608, 2640, 1443, 1448)
     ha, va, ht, vt, pclk = m['ha'], m['va'], m['ht'], m['vt'], m['pclk']
     hsw = m['hse'] - m['hss']; hbe = ht - m['hss']          # sync width; sync + back porch (blank end, counted from sync start)
@@ -137,6 +138,33 @@ def gen(m, outdir, edid=b''):
             elif reg in geo: new = geo[reg](old)
             out.append('w %x %x %s' % (reg, new & 0xffffffff, ' '.join(f[3:])))
         open(os.path.join(outdir, dst), 'w').write('\n'.join(out))
+    if dp:      # DisplayPort on the USB-C port: the DP templates with the same geometry, DP DTO, MSA and M/N for the link rate
+        lanes, rate = dp
+        fixed = captured and rate == 0x14 and lanes == 2
+        dpm = {0x145: pclk * 1000, 0x146: 598874000,                      # DP DTO: pixel clock over the 598.874 MHz reference, in Hz
+               0x580c: ht << 16 | vt, 0x580d: hbe << 16 | vbe,
+               0x580e: (0 if m['hpos'] else 1) << 31 | hsw << 16 | (0 if m['vpos'] else 1) << 15 | vsw, 0x580f: ha << 16 | va,
+               0x57d2: round(32768 * pclk / (rate * 27000)), 0x57cb: lanes - 1}
+        for src, dst in (('plan_dp_pre.txt', 'dp_pre.txt'), ('plan_dp_post.txt', 'dp_post.txt'), ('plan_dp_plane.txt', 'dp_plane.txt')):
+            out = []
+            for ln in open(os.path.join(HERE, src)).read().split('\n'):
+                f = ln.split()
+                if fixed or not f or f[0] != 'w': out.append(ln); continue
+                reg = int(f[1], 16); old = int(f[2], 16)
+                new = dpm[reg] if reg in dpm else geo[reg](old) if reg in geo and not captured else old
+                out.append('w %x %x %s' % (reg, new & 0xffffffff, ' '.join(f[3:])))
+            open(os.path.join(outdir, dst), 'w').write('\n'.join(out))
+        ep = audio_endpoint(edid, True) if len(edid) >= 256 else None
+        if ep:      # DP audio as Linux sets it: audio DTO1 from the DP reference clock, AFMT2 fed by endpoint 2, DP secondary data packets
+            a = ['# DP audio: audio DTO1 (48 kHz family over the 598.874 MHz DP reference), AFMT2', 'w 3521 0 DCCG_AUDIO_DTBCLK_DTO_PHASE', 'w 3522 0 DCCG_AUDIO_DTBCLK_DTO_MODULO',
+                 'w 16b 100030 DCCG_AUDIO_DTO_SOURCE', 'w 16b 100010 DCCG_AUDIO_DTO_SOURCE', 'w 16f 5b6184 DCCG_AUDIO_DTO1_MODULE', 'w 16e 3a980 DCCG_AUDIO_DTO1_PHASE',
+                 'w 5745 2 AFMT2_AFMT_AUDIO_SRC_CONTROL', 'w 5735 300 AFMT2_AFMT_AUDIO_PACKET_CONTROL2']
+            b = ['# DP audio on: secondary data packets (audio stream, timestamp, info frame)', 'w 5770 1 DIG2_AFMT_CNTL', 'w 57f1 8000 DP2_DP_SEC_AUD_N', 'w 57f5 1 DP2_DP_SEC_TIMESTAMP',
+                 'w 5747 101 AFMT2_AFMT_MEM_PWR', 'w 5742 4000800 AFMT2_AFMT_AUDIO_PACKET_CONTROL', 'w 5735 300 AFMT2_AFMT_AUDIO_PACKET_CONTROL2', 'w 5743 80 AFMT2_AFMT_INFOFRAME_CONTROL0',
+                 'w 5738 0 AFMT2_AFMT_60958_0', 'w 57eb 10 DP2_DP_SEC_CNTL', 'w 57eb 1110 DP2_DP_SEC_CNTL', 'w 57eb 1111 DP2_DP_SEC_CNTL', 'w 5747 1 AFMT2_AFMT_MEM_PWR',
+                 'w 5742 4000801 AFMT2_AFMT_AUDIO_PACKET_CONTROL']
+            open(os.path.join(outdir, 'dp_audio.txt'), 'w').write('\n'.join(a + ep[0]) + '\n')
+            open(os.path.join(outdir, 'dp_audio_on.txt'), 'w').write('\n'.join(b + ep[1]) + '\n')
     ep = audio_endpoint(edid) if len(edid) >= 256 else None
     if ep:
         with open(os.path.join(outdir, 'audio.txt'), 'a') as f: f.write('\n' + '\n'.join(ep[0]) + '\n')
@@ -147,12 +175,15 @@ def gen(m, outdir, edid=b''):
 
 if __name__ == '__main__':
     e = open(sys.argv[1], 'rb').read()
-    want = None
-    if len(sys.argv) > 3:
+    want = None; dp = None
+    if '--dp' in sys.argv:                 # --dp <lanes> <rate code>: the trained link; it bounds the pixel clock (8 bpc RGB)
+        i = sys.argv.index('--dp'); dp = (int(sys.argv[i + 1]), int(sys.argv[i + 2], 0)); del sys.argv[i:i + 3]
+        MAXCLK = int(dp[0] * dp[1] * 9000 * 0.97)      # lanes x rate x 0.27 Gbit/s x 8/10, over 24 bits a pixel, some margin
+    if len(sys.argv) > 3 and 'x' in sys.argv[3]:
         size, _, r = sys.argv[3].partition('@')
         w, h = size.split('x'); want = (int(w), int(h), float(r) if r else None)
     m = pick(e, want)
     os.makedirs(sys.argv[2], exist_ok=True)
-    cap, pitch = gen(m, sys.argv[2], e)
+    cap, pitch = gen(m, sys.argv[2], e, dp)
     print('mode %dx%d@%.2f pclk %d kHz totals %dx%d pitch %d (%s)' % (m['ha'], m['va'], m['pclk'] * 1000 / (m['ht'] * m['vt']), m['pclk'], m['ht'], m['vt'],
           pitch, 'captured values' if cap else 'generated, firmware-style requests'))

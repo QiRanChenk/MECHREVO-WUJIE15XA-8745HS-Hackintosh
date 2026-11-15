@@ -1,0 +1,5 @@
+# DP output off, part 1 (before the transmitter): plane blanked, video stream off
+w 3b8f f001b HUBP1_DCHUBP_CNTL
+w 57cc 10200 DP2_DP_VID_STREAM_CNTL
+s 20
+w 57cd 3f000011 DP2_DP_STEER_FIFO
