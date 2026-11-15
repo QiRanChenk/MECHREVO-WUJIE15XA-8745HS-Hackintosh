@@ -100,8 +100,8 @@ final class TCCPrompter {
             let a = NSAlert()
             let title = FileManager.default.displayName(atPath: app)
             a.messageText = L("“\(title)”想使用\(name.zh)", "“\(title)” would like to use \(name.en)")
-            a.informativeText = L("系统的权限弹窗在这台机器上不会出现（核显驱动需要关闭 AMFI）。选择“允许”后由 powerbar 写入授权，可能需要在该程序里重新打开一次设备。",
-                                  "The system's own permission dialog does not appear on this machine (the GPU driver needs AMFI off). “Allow” lets powerbar write the grant; you may have to reopen the device in the app.")
+            a.informativeText = L("系统的权限弹窗在这台机器上不会出现（核显驱动需要关闭 AMFI）。选择“允许”后由 powerbar 写入授权；之后请退出并重新打开该程序，授权才会生效。",
+                                  "The system's own permission dialog does not appear on this machine (the GPU driver needs AMFI off). “Allow” lets powerbar write the grant; quit and reopen the app afterwards for it to take effect.")
             a.addButton(withTitle: L("允许", "Allow")); a.addButton(withTitle: L("不允许", "Don't Allow"))
             a.icon = NSWorkspace.shared.icon(forFile: app)
             NSApp.activate(ignoringOtherApps: true)
