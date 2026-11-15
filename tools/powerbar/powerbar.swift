@@ -87,7 +87,7 @@ final class App: NSObject, NSApplicationDelegate {
     func sliderText(_ v: Int) -> String { L("性能 ← \(v) → 省电", "Performance ← \(v) → Saver") }
     @objc func toggleLanguage() {
         english.toggle(); UserDefaults.standard.set(english, forKey: "english")
-        extSetAt = Date.distantPast
+        extSetAt = Date.distantPast; volSetAt = Date.distantPast
         relabel(); tick()
     }
     func relabel() {
@@ -153,12 +153,36 @@ final class App: NSObject, NSApplicationDelegate {
         var v: Float = 0
         if get(d, &v) == 0, v > 0.004 { panelLevel = v }
     }
+    // the monitor's speaker volume (DDC/CI VCP 0x62): HDMI audio is digital and macOS offers no volume for it
+    let volSlider = NSSlider(value: 50, minValue: 0, maxValue: 100, target: nil, action: nil)
+    let volLabel = NSTextField(labelWithString: "")
+    let volItem = NSMenuItem()
+    var volWrite: Timer? = nil
+    var volSetAt = Date.distantPast, volSentAt = Date.distantPast
+    func volText(_ v: Int) -> String { L("外接显示器音量 \(v)%", "External display volume \(v)%") }
+    @objc func volSlid(_ s: NSSlider) {
+        let v = Int(s.doubleValue.rounded())
+        volLabel.stringValue = volText(v); volSetAt = Date()
+        volWrite?.invalidate()
+        let send = { try? "\(v)\n".write(toFile: self.extDir + "/volume", atomically: true, encoding: .utf8); self.volSentAt = Date() }
+        let since = Date().timeIntervalSince(volSentAt)
+        if since >= 0.12 { send() }
+        else {
+            let t = Timer(timeInterval: 0.12 - since, repeats: false) { _ in send() }
+            RunLoop.main.add(t, forMode: .common); volWrite = t
+        }
+    }
     func refreshExt() {
         let st = ((try? String(contentsOfFile: extDir + "/state", encoding: .utf8)) ?? "").split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int($0) }
         extItem.isHidden = st.count < 2 || st[1] <= 0
         if st.count >= 2, st[1] > 0, Date().timeIntervalSince(extSetAt) > 5 {   // not under the user's hand
             let pct = Int((Double(st[0]) * 100 / Double(st[1])).rounded())
             extSlider.doubleValue = Double(pct); extLabel.stringValue = extText(pct)
+        }
+        volItem.isHidden = st.count < 4 || st[3] <= 0
+        if st.count >= 4, st[3] > 0, Date().timeIntervalSince(volSetAt) > 5 {
+            let pct = Int((Double(st[2]) * 100 / Double(st[3])).rounded())
+            volSlider.doubleValue = Double(pct); volLabel.stringValue = volText(pct)
         }
     }
     var modeItems: [NSMenuItem] = []
@@ -225,6 +249,13 @@ final class App: NSObject, NSApplicationDelegate {
         extSlider.target = self; extSlider.action = #selector(extSlid(_:)); extSlider.isContinuous = true
         ebox.addSubview(extLabel); ebox.addSubview(extSlider)
         extItem.view = ebox; extItem.isHidden = true; menu.addItem(extItem)
+        let vbox = NSView(frame: NSRect(x: 0, y: 0, width: 330, height: 46))
+        volLabel.frame = NSRect(x: 20, y: 26, width: 290, height: 16)
+        volLabel.font = NSFont.menuFont(ofSize: 11); volLabel.textColor = .secondaryLabelColor; volLabel.alignment = .center
+        volSlider.frame = NSRect(x: 20, y: 4, width: 290, height: 22)
+        volSlider.target = self; volSlider.action = #selector(volSlid(_:)); volSlider.isContinuous = true
+        vbox.addSubview(volLabel); vbox.addSubview(volSlider)
+        volItem.view = vbox; volItem.isHidden = true; menu.addItem(volItem)
         lidItem.target = self; lidItem.action = #selector(toggleLid); lidItem.state = lidAwake() ? .on : .off
         menu.addItem(lidItem); menu.addItem(.separator())
         langItem.target = self; langItem.action = #selector(toggleLanguage)

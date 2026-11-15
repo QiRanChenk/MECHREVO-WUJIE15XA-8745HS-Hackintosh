@@ -46,7 +46,45 @@ def pick(e, want):      # want: (width, height, refresh or None)
     if not ok: return FHD
     return ok[0] if ok[0] is ms[0] else max(ok, key=lambda m: (m['ha'] * m['va'], m['pclk']))   # the preferred timing when it fits
 
-def gen(m, outdir):
+# The audio endpoint of the HDMI port (AZF0ENDPOINT1: index 0x384c, data 0x384d), as Linux's dce_audio sets it at
+# every enable: what the sink can play (from the EDID's CTA block) and its name, for the HD-audio codec's ELD. Without
+# it the codec reports no monitor. Returns the plan lines for before the link comes up and for after, or None when the
+# EDID announces no audio.
+def audio_endpoint(e):
+    sad = None; spk = 1; basic = False
+    for b in range(1, len(e) // 128):
+        x = e[b * 128:(b + 1) * 128]
+        if x[0] != 2: continue
+        basic = basic or bool(x[3] & 0x40)
+        i = 4
+        while i < x[2]:
+            tag, n = x[i] >> 5, x[i] & 31
+            if tag == 1:
+                for j in range(i + 1, i + 1 + n - 2, 3):
+                    if x[j] >> 3 & 15 == 1 and (sad is None or (x[j] & 7) > (sad[0] & 7)): sad = x[j:j + 3]   # LPCM, most channels
+            elif tag == 4 and n >= 1: spk = x[i + 1] & 0x7f or 1
+            i += 1 + n
+    if sad is None and not basic: return None
+    if sad is None: sad = bytes([0x09, 0x07, 0x07])      # basic audio: 2-channel LPCM, 32/44.1/48 kHz, 16/20/24 bit
+    name = b''
+    for o in range(54, 126, 18):
+        if e[o:o + 3] == b'\0\0\0' and e[o + 3] == 0xfc: name = e[o + 5:o + 18].split(b'\n')[0].rstrip()
+    name = name[:16]
+    w = lambda idx, val, note='': ['w 384c %x AZF0ENDPOINT1_INDEX' % idx, 'w 384d %x AZF0ENDPOINT1_DATA %s' % (val, note)]
+    pre = ['# audio endpoint 1: sink capabilities and name (from the EDID)']
+    for v in (0x80000001, 1, 0, 1): pre += w(0x54, v, 'hot plug control')
+    pre += w(0x25, 0x10000 | spk, 'speaker allocation, HDMI') + w(0x27, 0)
+    pre += w(0x28, (sad[0] & 7) | sad[1] << 8 | sad[2] << 16 | sad[1] << 24, 'LPCM: channels - 1, rates, sample sizes')
+    for idx in (0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x31, 0x32, 0x33, 0x35): pre += w(idx, 0)
+    pre += w(0x38, 1) + w(0x37, 0) + w(0x37, 0)
+    pre += w(0x3a, e[8] | e[9] << 8 | e[10] << 16 | e[11] << 24, 'manufacturer, product') + w(0x3b, len(name) + 1 if name else 0)
+    pre += w(0x3c, 0x5558859e, 'port id') + w(0x3d, 0x0d989449)
+    padded = name + bytes(20 - len(name))
+    for k in range(5): pre += w(0x3e + k, int.from_bytes(padded[k * 4:k * 4 + 4], 'little'), 'name')
+    post = ['# audio endpoint 1 on (after the link is up)'] + w(0x54, 0x10) + w(0x54, 0x80000001) + w(0x54, 0x80000000)
+    return pre, post
+
+def gen(m, outdir, edid=b''):
     captured = not os.environ.get('HDMIMODE_FORCE') and (m['pclk'], m['ha'], m['va'], m['ht'], m['vt'], m['hss'], m['hse'], m['vss'], m['vse']) == (244800, 2560, 1440, 2720, 1500, 2608, 2640, 1443, 1448)
     ha, va, ht, vt, pclk = m['ha'], m['va'], m['ht'], m['vt'], m['pclk']
     hsw = m['hse'] - m['hss']; hbe = ht - m['hss']          # sync width; sync + back porch (blank end, counted from sync start)
@@ -99,6 +137,10 @@ def gen(m, outdir):
             elif reg in geo: new = geo[reg](old)
             out.append('w %x %x %s' % (reg, new & 0xffffffff, ' '.join(f[3:])))
         open(os.path.join(outdir, dst), 'w').write('\n'.join(out))
+    ep = audio_endpoint(edid) if len(edid) >= 256 else None
+    if ep:
+        with open(os.path.join(outdir, 'audio.txt'), 'a') as f: f.write('\n' + '\n'.join(ep[0]) + '\n')
+        open(os.path.join(outdir, 'audio_on.txt'), 'w').write('\n'.join(ep[1]) + '\n')
     open(os.path.join(outdir, 'mode.txt'), 'w').write('%d %d %d %d %d %d %d %d %d %d\n' % (ha, va, pclk, ht, m['hss'], m['hse'], vt, m['vss'], m['vse'],
                                                                                          m['hpos'] | m['vpos'] << 1))
     return captured, pitch
@@ -111,6 +153,6 @@ if __name__ == '__main__':
         w, h = size.split('x'); want = (int(w), int(h), float(r) if r else None)
     m = pick(e, want)
     os.makedirs(sys.argv[2], exist_ok=True)
-    cap, pitch = gen(m, sys.argv[2])
+    cap, pitch = gen(m, sys.argv[2], e)
     print('mode %dx%d@%.2f pclk %d kHz totals %dx%d pitch %d (%s)' % (m['ha'], m['va'], m['pclk'] * 1000 / (m['ht'] * m['vt']), m['pclk'], m['ht'], m['vt'],
           pitch, 'captured values' if cap else 'generated, firmware-style requests'))

@@ -28,24 +28,38 @@ light() {
     online || ./fb1cfg online /tmp/hdmid-edid.bin 1440p
   fi
 }
-# The monitor's own brightness (DDC/CI, VCP 0x10): $S/state holds "<value> <max>" while a monitor answers, and a
-# number written to $S/brightness (0-100 %, by the powerbar menu) is applied. Checked every half second; the port's
+# The monitor's own brightness and speaker volume (DDC/CI, VCP 0x10 and 0x62): $S/state holds "<brightness> <max>
+# <volume> <max>" while a monitor answers, and a number written to $S/brightness or $S/volume (0-100 %, by the
+# powerbar menu) is applied. HDMI audio is digital: the Mac's own volume control does not act on it. Checked every half second; the port's
 # state every two.
-S=/Users/Shared/hdmi; mkdir -p $S; chmod 777 $S; rm -f $S/state $S/brightness
-vmax=0
+S=/Users/Shared/hdmi; mkdir -p $S; chmod 777 $S; rm -f $S/state $S/brightness $S/volume
+vmax=0; cur=0; amax=0; acur=0       # brightness (VCP 0x10) and speaker volume (VCP 0x62); max 0 = the monitor has no such control
+vcp_read() { ./ddcbb vcp $1 2>/dev/null | awk '/^vcp 0x[0-9a-f]+ =/{print $4, $6}'; }
+put_state() { if [ $vmax -gt 0 ]; then echo "$cur $vmax $acur $amax" > $S/state; chmod 644 $S/state; else rm -f $S/state; fi; }
 bright_state() {
-  out=$(./ddcbb vcp 0x10 2>/dev/null | awk '/^vcp 0x10 =/{print $4, $6}')
-  if [ -n "$out" ]; then echo "$out" > $S/state; chmod 644 $S/state; vmax=${out#* }; else rm -f $S/state; vmax=0; fi
+  out=$(vcp_read 0x10)
+  if [ -n "$out" ]; then cur=${out% *}; vmax=${out#* }; else vmax=0; fi
+  out=$(vcp_read 0x62)
+  if [ -n "$out" ]; then acur=${out% *}; amax=${out#* }; else amax=0; fi
+  put_state
+}
+# apply <file> <vcp code> <max>: a percentage written by the powerbar menu
+apply() {
+  [ -f $S/$1 ] || return 1
+  pct=$(tr -dc '0-9' < $S/$1 | cut -c1-3); rm -f $S/$1
+  [ -n "$pct" ] && [ "$3" -gt 0 ] || return 1
+  [ "$pct" -gt 100 ] && pct=100
+  v=$(( (pct * $3 + 50) / 100 ))
+  ./ddcbb vcp $2 $v >/dev/null 2>&1 || return 1
+  hot=100                 # a slider is in use: look again every 0.1 s for the next ten seconds
 }
 bright_apply() {
-  [ -f $S/brightness ] || return
-  pct=$(tr -dc '0-9' < $S/brightness | cut -c1-3); rm -f $S/brightness
-  [ -n "$pct" ] && [ "$vmax" -gt 0 ] || return
-  [ "$pct" -gt 100 ] && pct=100
-  v=$(( (pct * vmax + 50) / 100 ))
-  ./ddcbb vcp 0x10 $v >/dev/null 2>&1 && echo "$v $vmax" > $S/state
-  hot=100                 # the slider is in use: look again every 0.1 s for the next ten seconds
+  apply brightness 0x10 $vmax && { cur=$v; put_state; }
+  apply volume 0x62 $amax && { acur=$v; put_state; }
 }
+# The 780M's clock cap: 800 MHz saves power on the panel alone (tools/gpuclk), but two 2.5K displays stutter at it;
+# 1600 MHz while a monitor is lit. $D/gfxclk holds another value for that case.
+gfxclk() { /Users/Shared/gpu/phxctl/phxctl smu 0x1b $1 >/dev/null 2>&1; say "GFX clock cap $1 MHz"; }
 say "hdmid start"
 dark=0; n=0; bs=0; hot=0
 while :; do
@@ -63,10 +77,11 @@ while :; do
     if busy || [ $(( $(sysctl -n debug.nvaccel_heads_piped 2>/dev/null || echo 0) & 2 )) = 0 ]; then sleep 2; continue; fi
     sleep 1; [ $(( $(sysctl -n debug.phxfb1_hw) & 1 )) = 1 ] || continue
     say "monitor on the HDMI port (hw $hw): lighting"; light; say "-> hw $(sysctl -n debug.phxfb1_hw), $(./fb1cfg show)"
+    gfxclk $(cat $D/gfxclk 2>/dev/null || echo 1600)
     bs=0
   elif [ $hpd = 0 ] && { [ $lit = 1 ] || online; }; then
     sleep 1; [ $(( $(sysctl -n debug.phxfb1_hw) & 1 )) = 0 ] || continue
-    say "monitor gone (hw $hw)"; ./fb1cfg offline >/dev/null; ./hdmi-off.sh; rm -f $S/state; vmax=0; bs=0
+    say "monitor gone (hw $hw)"; ./fb1cfg offline >/dev/null; ./hdmi-off.sh; rm -f $S/state; vmax=0; bs=0; gfxclk 800
   elif [ $lit = 1 ] && [ $dark = 3 ]; then
     say "display sleep: port off"; ./hdmi-off.sh
   fi

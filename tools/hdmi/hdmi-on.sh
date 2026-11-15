@@ -21,4 +21,5 @@ for p in plan_init_off.txt $AUD $SIG $PL plan_fmt8.txt; do ./dmubboot run $p >/d
 $P wreg 0x5d28 0x80 >/dev/null; $P wreg 0x565c 0 >/dev/null
 $P wreg 0x124 $($P regs 0x124 | awk '/^0x/{print $2}') >/dev/null      # dccg314_trigger_dio_fifo_resync
 $P wreg 0x36b8 0x10080003 >/dev/null                                    # GPINT: streams 0 and 1 active
+[ -n "${PLANS:-}" ] && [ -f "$PLANS/audio_on.txt" ] && ./dmubboot run $PLANS/audio_on.txt >/dev/null 2>&1    # audio endpoint on
 echo "HDMI on: BE_EN $($P regs 0x5672 | awk '/^0x/{print $2}') FE $($P regs 0x564b | awk '/^0x/{print $2}') FIFO $($P regs 0x5652 | awk '/^0x/{print $2}')" | tee -a $L

@@ -105,7 +105,11 @@ nullarc 0.4.0 只驱动内屏。这里让机身 HDMI 口成为 macOS 里真正�
 2. **`tools/hdmi`**（root 服务 `hdmid`）：每 2 秒看一次 HDMI 热插拔线；插入时用 GPIO 位操作读 EDID（`ddcbb`），按首选时序生成寄存器序列（`hdmimode.py`），通过 PSP 载入 Linux 的 DMUB 固件并重启 DMCUB（`dmubboot`），点亮显示管线 1（`hdmi-on.sh`），再把模式和 EDID 告诉帧缓冲（`fb1cfg`）。拔出、显示器休眠时关闭输出。
 3. **powerbar**：菜单里多一条"外接显示器亮度"（DDC/CI，VCP 0x10）。
 
-限制：8 位色 RGB，像素时钟不超过 340 MHz（2560x1440@75、3440x1440@60 可用，4K60 不行）；没有 HDMI 声音；只在本机的 DCN 3.1.4 上验证过两台显示器。想指定分辨率：把一行如 `2560x1440@60` 写进 `/Users/Shared/gpu/hdmi/mode` 后重插。
+限制：8 位色 RGB，像素时钟不超过 340 MHz（2560x1440@75、3440x1440@60 可用，4K60 不行）；只在本机的 DCN 3.1.4 上验证过两台显示器。想指定分辨率：把一行如 `2560x1440@60` 写进 `/Users/Shared/gpu/hdmi/mode` 后重插。
+
+HDMI 声音：`hdmimode.py` 按 EDID 写好 HDMI 口的音频端点（显示器的音频能力和名称，和 Linux 写的一致），核显的 HD-audio 设备（1002:1640）由 [VoodooHDA](https://github.com/CloverHackyColor/VoodooHDA) 3.6.8 驱动：把它的 Info.plist 改成只匹配 `IOPCIMatch = 0x16401002`（这样不碰内置声卡），放进 `/Library/Extensions` 并重建辅助内核集合。不要用引导器注入版（VoodooHDA_BL）：它自带一份 IOAudioFamily，会让 SimpleHDA 带的内置声卡失效。HDMI 是数字输出，系统音量键不起作用，powerbar 里有"外接显示器音量"（DDC/CI，VCP 0x62）。
+
+两块 2.5K 屏在 800 MHz 的核显限频下会卡，`hdmid` 在外接屏点亮时把上限提到 1600 MHz（`/Users/Shared/gpu/hdmi/gfxclk` 可改），拔掉后回到 800。
 
 安装：把 linux-firmware 的 `amdgpu/dcn_3_1_4_dmcub.bin` 和本机的 `vbios.bin`（Linux 下 `/sys/kernel/debug/dri/0/amdgpu_vbios`）放进 `tools/hdmi/`，然后 `sudo tools/hdmi/install.sh`。需要 boot-arg `phxdebug=1` 和带"不回读写寄存器"的 PhxBringup（同一 fork 的 `test14` 分支起）。
 
@@ -157,4 +161,4 @@ Source patches for the modified GPL/BSD kexts are in `patches/`.
 
 ### External display (HDMI)
 
-The HDMI port works as a real second display (extended desktop, hot-plug, display sleep, clamshell). It needs the `hdmi-fb2` branch of [QiRanChenk/nullarc](https://github.com/QiRanChenk/nullarc) (PhxAccel with a second framebuffer, boot-arg `phxfb2=1`) and `tools/hdmi` (a root daemon that loads Linux's DMUB firmware, programs display pipe 1 from the monitor's EDID and reports the mode to the framebuffer). Limits: 8 bpc RGB, pixel clock up to 340 MHz, no HDMI audio, tested on this DCN 3.1.4 machine with two monitors only. See the Chinese section above for the details and pitfalls.
+The HDMI port works as a real second display (extended desktop, hot-plug, display sleep, clamshell). It needs the `hdmi-fb2` branch of [QiRanChenk/nullarc](https://github.com/QiRanChenk/nullarc) (PhxAccel with a second framebuffer, boot-arg `phxfb2=1`) and `tools/hdmi` (a root daemon that loads Linux's DMUB firmware, programs display pipe 1 from the monitor's EDID and reports the mode to the framebuffer). Limits: 8 bpc RGB, pixel clock up to 340 MHz, HDMI audio through VoodooHDA restricted to the Radeon audio function, tested on this DCN 3.1.4 machine with two monitors only. See the Chinese section above for the details and pitfalls.
