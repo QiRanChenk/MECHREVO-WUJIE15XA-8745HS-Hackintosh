@@ -58,6 +58,75 @@ final class CPUPower {
 }
 
 
+// ---- permission prompts ---------------------------------------------------------------------------------------------
+// With AMFI off (which the GPU driver needs: its Metal plugin is loaded into WindowServer and every app) tccd never
+// shows a permission dialog: it logs "Policy disallows prompt" and denies. This watches tccd's log for those lines,
+// asks the question itself for camera and microphone, and on "Allow" writes the grant into the user's TCC database
+// (what System Settings would do; needs SIP off, as the driver does). One question per app and service per run; a
+// refusal is remembered in the user defaults until "Reset" in a later prompt... it is simply not asked again.
+final class TCCPrompter {
+    let services: [String: (zh: String, en: String)] = ["kTCCServiceCamera": ("摄像头", "the camera"), "kTCCServiceMicrophone": ("麦克风", "the microphone")]
+    var asked = Set<String>()
+    var proc: Process?
+    func start() {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+        p.arguments = ["stream", "--style", "compact", "--predicate", "process == \"tccd\" AND eventMessage CONTAINS \"Policy disallows prompt\""]
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
+        var rest = ""
+        pipe.fileHandleForReading.readabilityHandler = { h in
+            guard let chunk = String(data: h.availableData, encoding: .utf8), !chunk.isEmpty else { return }
+            rest += chunk
+            while let nl = rest.firstIndex(of: "\n") { let line = String(rest[..<nl]); rest = String(rest[rest.index(after: nl)...]); self.handle(line) }
+        }
+        try? p.run(); proc = p
+    }
+    func field(_ line: String, _ key: String, until: String) -> String? {
+        guard let r = line.range(of: key) else { return nil }
+        let tail = line[r.upperBound...]
+        return String(tail[..<(tail.range(of: until)?.lowerBound ?? tail.endIndex)])
+    }
+    func handle(_ line: String) {
+        // ... Resp:{TCCDProcess: identifier=com.x.y, pid=.., binary_path=/Applications/X.app/Contents/MacOS/X}; access to kTCCServiceCamera denied
+        guard let resp = line.range(of: "Resp:{") else { return }
+        let r = String(line[resp.upperBound...])
+        guard let ident = field(r, "identifier=", until: ","), let bin = field(r, "binary_path=", until: "}"),
+              let svc = field(line, "access to ", until: " denied"), let name = services[svc],
+              !ident.hasPrefix("com.apple."), let appEnd = bin.range(of: ".app/") else { return }
+        let app = String(bin[..<appEnd.lowerBound]) + ".app"
+        let key = svc + " " + ident
+        if asked.contains(key) || UserDefaults.standard.bool(forKey: "tcc-refused " + key) { return }
+        asked.insert(key)
+        DispatchQueue.main.async {
+            let a = NSAlert()
+            let title = FileManager.default.displayName(atPath: app)
+            a.messageText = L("“\(title)”想使用\(name.zh)", "“\(title)” would like to use \(name.en)")
+            a.informativeText = L("系统的权限弹窗在这台机器上不会出现（核显驱动需要关闭 AMFI）。选择“允许”后由 powerbar 写入授权，可能需要在该程序里重新打开一次设备。",
+                                  "The system's own permission dialog does not appear on this machine (the GPU driver needs AMFI off). “Allow” lets powerbar write the grant; you may have to reopen the device in the app.")
+            a.addButton(withTitle: L("允许", "Allow")); a.addButton(withTitle: L("不允许", "Don't Allow"))
+            a.icon = NSWorkspace.shared.icon(forFile: app)
+            NSApp.activate(ignoringOtherApps: true)
+            if a.runModal() == .alertFirstButtonReturn { self.grant(app, ident, svc) }
+            else { UserDefaults.standard.set(true, forKey: "tcc-refused " + key) }
+        }
+    }
+    func grant(_ app: String, _ ident: String, _ svc: String) {
+        let script = """
+        set -e
+        DB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+        REQ=$(codesign -d -r- "$1" 2>&1 | sed -n 's/^designated => //p'); [ -n "$REQ" ]
+        T=$(mktemp); echo "$REQ" | csreq -r- -b "$T"; HEX=$(xxd -p "$T" | tr -d '\n'); rm -f "$T"
+        sqlite3 "$DB" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, csreq, flags) VALUES ('$3', '$2', 0, 2, 3, 1, X'$HEX', 0);"
+        killall tccd 2>/dev/null || true
+        """
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/bash"); p.arguments = ["-c", script, "grant", app, ident, svc]
+        try? p.run(); p.waitUntilExit()
+        if p.terminationStatus != 0 {
+            let a = NSAlert(); a.messageText = L("写入授权失败", "The grant could not be written")
+            a.informativeText = L("程序没有可用的代码签名要求，或权限数据库不可写。", "The app has no usable code-signing requirement, or the permission database is not writable."); a.runModal()
+        }
+    }
+}
+
 // ---- small view helpers ------------------------------------------------------------------------------------------
 func label(_ s: String = "", size: CGFloat = 13, weight: NSFont.Weight = .regular, color: NSColor = .labelColor, mono: Bool = false) -> NSTextField {
     let t = NSTextField(labelWithString: s)
@@ -110,6 +179,7 @@ final class Card: NSView {
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let cpu = CPUPower()
+    let tcc = TCCPrompter()
     let width: CGFloat = 340
     var lastWatts: Double = 0
     var battAvg: Double? = nil      // battery watts averaged over about a minute: the estimate should not jump
@@ -355,6 +425,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = menu
         item.button?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         tick(); resize()
+        tcc.start()
         // .common: the panel keeps updating while the menu is open
         let t = Timer(timeInterval: 2, repeats: true) { _ in self.tick() }
         RunLoop.main.add(t, forMode: .common)
