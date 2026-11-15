@@ -6,6 +6,7 @@
 // GPU clock cap: /Users/Shared/cppc/gpu ("auto" or MHz), applied by cppcd too (SMU SetSoftMaxGfxClk); status in gpu-status.
 // External monitor: /Users/Shared/hdmi/state ("<brightness> <max> <volume> <max>", written by the root service hdmid
 // while a monitor answers DDC/CI) shows brightness and volume sliders; choices go to /Users/Shared/hdmi/brightness|volume.
+// With a monitor on each port (HDMI and USB-C) the USB-C one has the same files with the suffix -dp, and a card of its own.
 // The menu is one panel (a single view in the status item's menu): a readout card and a card per group of controls.
 import Cocoa
 import IOKit
@@ -404,6 +405,58 @@ final class Card: NSView {
     override var wantsUpdateLayer: Bool { true }
 }
 
+// One external monitor's card: brightness and volume sliders (DDC/CI through the hdmid service). suffix "" = the HDMI
+// port (or the one shared head), "-dp" = the USB-C port when each port has its own head.
+final class ExtMonitor: NSObject {
+    static let dir = "/Users/Shared/hdmi"
+    let suffix: String, port: String
+    let bright = NSSlider(value: 50, minValue: 0, maxValue: 100, target: nil, action: nil)
+    let volume = NSSlider(value: 50, minValue: 0, maxValue: 100, target: nil, action: nil)
+    let brightValue = label(size: 12, mono: true), volumeValue = label(size: 12, mono: true)
+    var brightRow: NSView!, volumeRow: NSView!, card: Card!
+    var sent = [Date.distantPast, Date.distantPast], set = [Date.distantPast, Date.distantPast]
+    var timer: [Timer?] = [nil, nil]
+    init(suffix: String, port: String) {
+        self.suffix = suffix; self.port = port
+        super.init()
+        func row(_ icon: String, _ s: NSSlider, _ value: NSTextField) -> NSView {
+            s.target = self; s.action = #selector(slid(_:)); s.isContinuous = true; s.controlSize = .small
+            value.alignment = .right; value.widthAnchor.constraint(equalToConstant: 44).isActive = true
+            return hstack([symbol(icon), s, value])
+        }
+        brightRow = row("sun.max", bright, brightValue); volumeRow = row("speaker.wave.2", volume, volumeValue)
+        card = Card([brightRow, volumeRow]); card.isHidden = true
+    }
+    static func read(_ path: String) -> String { ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
+    // follow the drag: a value goes out at once, at most one every 0.12 s (a DDC/CI write takes about that long), and
+    // the one the slider settles on always does
+    @objc func slid(_ s: NSSlider) {
+        let which = s === bright ? 0 : 1, v = Int(s.doubleValue.rounded())
+        (which == 0 ? brightValue : volumeValue).stringValue = "\(v)%"
+        set[which] = Date(); timer[which]?.invalidate()
+        let file = ExtMonitor.dir + (which == 0 ? "/brightness" : "/volume") + suffix
+        let send = { try? "\(v)\n".write(toFile: file, atomically: true, encoding: .utf8); self.sent[which] = Date() }
+        let since = Date().timeIntervalSince(sent[which])
+        if since >= 0.12 { send() }
+        else {
+            let t = Timer(timeInterval: 0.12 - since, repeats: false) { _ in send() }
+            RunLoop.main.add(t, forMode: .common); timer[which] = t
+        }
+    }
+    // returns true when the card appeared or went
+    func refresh() -> Bool {
+        let st = ExtMonitor.read(ExtMonitor.dir + "/state" + suffix).split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int($0) }
+        let hasB = st.count >= 2 && st[1] > 0, hasV = st.count >= 4 && st[3] > 0
+        let was = card.isHidden
+        card.isHidden = !(hasB || hasV); brightRow.isHidden = !hasB; volumeRow.isHidden = !hasV
+        if hasB, Date().timeIntervalSince(set[0]) > 5 { let p = Int((Double(st[0]) * 100 / Double(st[1])).rounded()); bright.doubleValue = Double(p); brightValue.stringValue = "\(p)%" }
+        if hasV, Date().timeIntervalSince(set[1]) > 5 { let p = Int((Double(st[2]) * 100 / Double(st[3])).rounded()); volume.doubleValue = Double(p); volumeValue.stringValue = "\(p)%" }
+        let name = ExtMonitor.read(ExtMonitor.dir + "/name" + suffix)
+        card.caption.stringValue = L("外接显示器", "EXTERNAL DISPLAY") + (name.isEmpty ? "" : " · " + name) + (suffix.isEmpty && name.isEmpty ? "" : " · " + port)
+        return was != card.isHidden
+    }
+}
+
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let cpu = CPUPower()
@@ -537,12 +590,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var gpuSetAt = Date.distantPast
 
     // the external monitor's own brightness and speaker volume (DDC/CI), applied by the root service hdmid
-    let extSlider = NSSlider(value: 50, minValue: 0, maxValue: 100, target: nil, action: nil)
-    let volSlider = NSSlider(value: 50, minValue: 0, maxValue: 100, target: nil, action: nil)
-    let extValue = label(size: 12, mono: true), volValue = label(size: 12, mono: true)
-    var extRow: NSView!, volRow: NSView!
-    var extSent = [Date.distantPast, Date.distantPast], extSet = [Date.distantPast, Date.distantPast]
-    var extTimer: [Timer?] = [nil, nil]
+    let ext = [ExtMonitor(suffix: "", port: "HDMI"), ExtMonitor(suffix: "-dp", port: "USB-C")]
 
     // options
     let lidSwitch = NSSwitch()
@@ -550,7 +598,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let langButton = NSButton(title: "", target: nil, action: nil), quitButton = NSButton(title: "", target: nil, action: nil)
 
     var cards: [Card] = []
-    var extCard: Card!
     let panel = NSStackView()
     let panelItem = NSMenuItem()
 
@@ -613,31 +660,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         else { gpuLine.stringValue = L("服务未运行", "service not running") }
     }
 
-    // ---- external monitor: brightness (0) and volume (1) ----
-    func extSend(_ which: Int, _ v: Int) {
-        // follow the drag: a value goes out at once, at most one every 0.12 s (a DDC/CI write takes about that long),
-        // and the one the slider settles on always does
-        extSet[which] = Date()
-        extTimer[which]?.invalidate()
-        let file = extDir + (which == 0 ? "/brightness" : "/volume")
-        let send = { self.writeLine(file, "\(v)"); self.extSent[which] = Date() }
-        let since = Date().timeIntervalSince(extSent[which])
-        if since >= 0.12 { send() }
-        else {
-            let t = Timer(timeInterval: 0.12 - since, repeats: false) { _ in send() }
-            RunLoop.main.add(t, forMode: .common); extTimer[which] = t
-        }
-    }
-    @objc func extSlid(_ s: NSSlider) { let v = Int(s.doubleValue.rounded()); extValue.stringValue = "\(v)%"; extSend(0, v) }
-    @objc func volSlid(_ s: NSSlider) { let v = Int(s.doubleValue.rounded()); volValue.stringValue = "\(v)%"; extSend(1, v) }
     func refreshExt() {
-        let st = readLine(extDir + "/state").split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int($0) }
-        let hasB = st.count >= 2 && st[1] > 0, hasV = st.count >= 4 && st[3] > 0
-        let was = extCard.isHidden
-        extCard.isHidden = !(hasB || hasV); extRow.isHidden = !hasB; volRow.isHidden = !hasV
-        if hasB, Date().timeIntervalSince(extSet[0]) > 5 { let p = Int((Double(st[0]) * 100 / Double(st[1])).rounded()); extSlider.doubleValue = Double(p); extValue.stringValue = "\(p)%" }
-        if hasV, Date().timeIntervalSince(extSet[1]) > 5 { let p = Int((Double(st[2]) * 100 / Double(st[3])).rounded()); volSlider.doubleValue = Double(p); volValue.stringValue = "\(p)%" }
-        if was != extCard.isHidden { resize() }
+        var changed = false
+        for e in ext { if e.refresh() { changed = true } }
+        if changed { resize() }
     }
 
     // ---- lid ----
@@ -682,7 +708,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let up = ProcessInfo.processInfo.systemUptime
         if let saved = bootLevel {
             if up > 240 { bootLevel = nil }
-            else { if abs(v - saved) > 0.02 { _ = set(d, saved) }; panelLevel = saved; return }
+            // only a reset to full brightness is undone: a level the user picks in these minutes stays (and is kept)
+            else if v >= 0.99 && saved < 0.99 { _ = set(d, saved); panelLevel = saved; return }
+            else if abs(v - saved) > 0.02 { bootLevel = nil }
         }
         panelLevel = v
         if abs(v - savedLevel) > 0.005 { savedLevel = v; UserDefaults.standard.set(v, forKey: "panel-level") }
@@ -693,15 +721,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // ---- language, layout ----
     @objc func toggleLanguage() {
         english.toggle(); UserDefaults.standard.set(english, forKey: "english")
-        extSet = [Date.distantPast, Date.distantPast]
+        for e in ext { e.set = [Date.distantPast, Date.distantPast] }
         relabel(); tick(); resize()
     }
     @objc func quit() { NSApp.terminate(nil) }
     func relabel() {
-        let caps = [L("电源", "POWER"), L("电量记录 · 近 12 小时", "CHARGE HISTORY · LAST 12 HOURS"), L("处理器", "PROCESSOR"), L("核显", "GRAPHICS"), L("外接显示器", "EXTERNAL DISPLAY"), L("选项", "OPTIONS")]
+        let caps = [L("电源", "POWER"), L("电量记录 · 近 12 小时", "CHARGE HISTORY · LAST 12 HOURS"), L("处理器", "PROCESSOR"), L("核显", "GRAPHICS"), "", "", L("选项", "OPTIONS")]
         axisL.stringValue = L("12 小时前", "12 h ago"); axisM.stringValue = L("绿色 = 接电", "green = on AC"); axisR.stringValue = L("现在", "now")
         recordsButton.title = L("记录曲线与明细…", "Chart and records…"); recordsCount = -1; refreshRecords()
-        for (i, c) in cards.enumerated() { c.caption.stringValue = caps[i] }
+        for (i, c) in cards.enumerated() where !caps[i].isEmpty { c.caption.stringValue = caps[i] }
+        refreshExt()
         for (i, p) in presets.enumerated() { modeSeg.setLabel(L(p.zh, p.en), forSegment: i) }
         sliderLeft.stringValue = L("性能", "Performance"); sliderRight.stringValue = L("省电", "Saver")
         gpuAutoLabel.stringValue = L("自动（单屏 800 · 外接屏 1600 MHz）", "Automatic (800 MHz alone, 1600 with a display)")
@@ -741,9 +770,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         gpuValue.alignment = .right; gpuValue.widthAnchor.constraint(equalToConstant: 72).isActive = true
         let gfx = Card([hstack([gpuAutoLabel, spacer(), gpuAuto]), hstack([symbol("speedometer"), gpuSlider, gpuValue]), gpuLine])
         // external display card
-        extRow = sliderRow("sun.max", extSlider, extValue, #selector(extSlid(_:)))
-        volRow = sliderRow("speaker.wave.2", volSlider, volValue, #selector(volSlid(_:)))
-        extCard = Card([extRow, volRow]); extCard.isHidden = true
         // options card
         lidSwitch.controlSize = .mini; lidSwitch.target = self; lidSwitch.action = #selector(toggleLid(_:))
         for b in [langButton, quitButton] { b.bezelStyle = .rounded; b.controlSize = .small; b.target = self }
@@ -753,7 +779,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let axis = hstack([axisL, spacer(), axisM, spacer(), axisR])
         let hist = Card([chart, axis, sessionLine, historyLine, hstack([spacer(), recordsButton])])
         hist.stack.setCustomSpacing(2, after: chart)
-        cards = [power, hist, proc, gfx, extCard, opts]
+        cards = [power, hist, proc, gfx, ext[0].card, ext[1].card, opts]
 
         panel.orientation = .vertical; panel.alignment = .leading; panel.spacing = 8
         panel.setHuggingPriority(.required, for: .vertical)
@@ -825,8 +851,11 @@ let delegate = App()
 if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot" {
     app.appearance = NSAppearance(named: CommandLine.arguments.count > 3 ? .darkAqua : .aqua)
     delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
-    delegate.extCard.isHidden = false; delegate.extRow.isHidden = false; delegate.volRow.isHidden = false
-    delegate.extValue.stringValue = "40%"; delegate.volValue.stringValue = "65%"; delegate.extSlider.doubleValue = 40; delegate.volSlider.doubleValue = 65
+    for (i, e) in delegate.ext.enumerated() {
+        e.card.isHidden = false; e.brightRow.isHidden = false; e.volumeRow.isHidden = false
+        e.brightValue.stringValue = "40%"; e.volumeValue.stringValue = "65%"; e.bright.doubleValue = 40; e.volume.doubleValue = 65
+        e.card.caption.stringValue = L("外接显示器", "EXTERNAL DISPLAY") + (i == 0 ? " · CS3421 · HDMI" : " · F27B23Q Pro · USB-C")
+    }
     if delegate.modeLine.stringValue.count > 12 { delegate.modeLine.stringValue = "EPP 128 · " + L("自动", "auto") + " · " + L("插电", "AC"); delegate.modeSeg.selectedSegment = 0 }
     delegate.gpuValue.stringValue = "1600 MHz"; delegate.gpuSlider.doubleValue = 1600; delegate.gpuAuto.state = .on
     delegate.gpuLine.stringValue = L("当前上限 1600 MHz · 越高越流畅，也越耗电", "Cap now 1600 MHz · higher is smoother and draws more")

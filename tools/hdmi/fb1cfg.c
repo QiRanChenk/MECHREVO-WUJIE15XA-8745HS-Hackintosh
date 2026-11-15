@@ -1,5 +1,6 @@
 // fb1cfg: tell PhxAMDFB's second head (HDMI, boot-arg phxfb2=1) which monitor and mode user space has lit, through
-// the sysctl debug.phxfb1_config.   cc -arch x86_64 -O2 -o fb1cfg fb1cfg.c     (run as root)
+// the sysctl debug.phxfb1_config. FB_HEAD=2 in the environment: the third head (USB-C DisplayPort, phxfb3=1),
+// debug.phxfb2_config.   cc -arch x86_64 -O2 -o fb1cfg fb1cfg.c     (run as root)
 //   fb1cfg show                      the framebuffer's current state
 //   fb1cfg offline                   nothing connected
 //   fb1cfg online <edid.bin> [1440p|auto]  the mode is the EDID's first detailed timing; with "1440p" the fixed
@@ -23,10 +24,11 @@ static void show(const struct PhxFB1Config *c) {
 }
 int main(int argc, char **argv) {
     struct PhxFB1Config c; size_t len = sizeof c;
+    const char *h = getenv("FB_HEAD"); const char *name = h && !strcmp(h, "2") ? "debug.phxfb2_config" : "debug.phxfb1_config";
     memset(&c, 0, sizeof c);
     if (argc < 2) { fprintf(stderr, "usage: fb1cfg show | offline | online <edid.bin> [1440p|auto]\n"); return 2; }
     if (!strcmp(argv[1], "show")) {
-        if (sysctlbyname("debug.phxfb1_config", &c, &len, NULL, 0)) { perror("debug.phxfb1_config"); return 1; }
+        if (sysctlbyname(name, &c, &len, NULL, 0)) { perror(name); return 1; }
         show(&c); return 0;
     }
     c.version = 1;
@@ -61,6 +63,6 @@ have:
         c.pitchPixels = (c.width + 63) & ~63u;
         c.refreshMilliHz = (uint32_t)((uint64_t)c.pixelClockKHz * 1000000ull / ((uint64_t)c.hTotal * c.vTotal));
     } else if (strcmp(argv[1], "offline")) { fprintf(stderr, "usage: fb1cfg show | offline | online <edid.bin> [1440p|auto]\n"); return 2; }
-    if (sysctlbyname("debug.phxfb1_config", NULL, NULL, &c, sizeof c)) { perror("debug.phxfb1_config"); return 1; }
+    if (sysctlbyname(name, NULL, NULL, &c, sizeof c)) { perror(name); return 1; }
     show(&c); return 0;
 }

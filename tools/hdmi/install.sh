@@ -10,7 +10,7 @@ clang -arch x86_64 -O2 -o dmubboot dmubboot.c -framework IOKit -framework CoreFo
 clang -arch x86_64 -O2 -o ddcbb ddcbb.c -framework IOKit -framework CoreFoundation
 clang -arch x86_64 -O2 -o fb1cfg fb1cfg.c
 D=/Users/Shared/gpu/hdmi; mkdir -p $D
-for f in dmubboot ddcbb fb1cfg hdmi-on.sh hdmi-off.sh dp-on.sh dp-off.sh hdmid.sh hdmimode.py; do install -m 755 -o root -g wheel $f $D/$f; done
+for f in dmubboot ddcbb fb1cfg hdmi-on.sh hdmi-off.sh dp-on.sh dp-off.sh streams.sh hdmid.sh hdmimode.py; do install -m 755 -o root -g wheel $f $D/$f; done
 for f in plan_*.txt dcn_3_1_4_dmcub.bin vbios.bin; do install -m 644 -o root -g wheel $f $D/; done
 install -m 644 -o root -g wheel local.hdmid.plist /Library/LaunchDaemons/local.hdmid.plist
 launchctl bootout system/local.hdmid 2>/dev/null || true

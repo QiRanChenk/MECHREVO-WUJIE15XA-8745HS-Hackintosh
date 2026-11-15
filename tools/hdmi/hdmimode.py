@@ -87,7 +87,17 @@ def audio_endpoint(e, dp=False):
     post = ['# audio endpoint on (after the link is up)'] + w(0x54, 0x10) + w(0x54, 0x80000001) + w(0x54, 0x80000000)
     return pre, post
 
-def gen(m, outdir, edid=b'', dp=None):
+# Display pipe 2 (USB-C DisplayPort while the HDMI port holds pipe 1, boot-arg phxfb3=1): the pipe-1 registers of the
+# geo / dlg / dpm tables below and their pipe-2 counterparts (from the Linux capture with three displays, 2026-11-15).
+P2 = {0x15a: 0x15b, 0x506a: 0x50ea, 0x506c: 0x50ec, 0x506b: 0x50eb, 0x506d: 0x50ed, 0x506f: 0x50ef, 0x5071: 0x50f1, 0x5070: 0x50f0,
+      0x5077: 0x50f7, 0x5076: 0x50f6, 0x5078: 0x50f8, 0x39ee: 0x39ef, 0x50c6: 0x5146, 0x50c7: 0x5147, 0x50c8: 0x5148, 0x4d70: 0x4dca,
+      0x3ba3: 0x3c7f, 0x3b8f: 0x3c6b, 0x433d: 0x44a8, 0x433e: 0x44a9, 0x3b86: 0x3c62, 0x3b8a: 0x3c66, 0x3b88: 0x3c64, 0x3b8c: 0x3c68,
+      0x3b8d: 0x3c69, 0x3bc5: 0x3ca1, 0x3bc6: 0x3ca2, 0x3bc7: 0x3ca3, 0x3bc8: 0x3ca4, 0x3bc9: 0x3ca5, 0x3bca: 0x3ca6, 0x3bcc: 0x3ca8,
+      0x3be0: 0x3cbc, 0x3be1: 0x3cbd, 0x3be2: 0x3cbe, 0x3be3: 0x3cbf, 0x3be4: 0x3cc0, 0x3be6: 0x3cc2, 0x3be7: 0x3cc3, 0x3be9: 0x3cc5,
+      0x3bea: 0x3cc6, 0x3beb: 0x3cc7, 0x3bec: 0x3cc8, 0x3bed: 0x3cc9, 0x3bee: 0x3cca, 0x3bef: 0x3ccb, 0x3bf2: 0x3cce, 0x3bf3: 0x3ccf,
+      0x3bf6: 0x3cd2, 0x3bf7: 0x3cd3, 0x3bf9: 0x3cd5, 0x145: 0x149, 0x146: 0x14a}
+
+def gen(m, outdir, edid=b'', dp=None, pipe=1):
     captured = not os.environ.get('HDMIMODE_FORCE') and (m['pclk'], m['ha'], m['va'], m['ht'], m['vt'], m['hss'], m['hse'], m['vss'], m['vse']) == (244800, 2560, 1440, 2720, 1500, 2608, 2640, 1443, 1448)
     ha, va, ht, vt, pclk = m['ha'], m['va'], m['ht'], m['vt'], m['pclk']
     hsw = m['hse'] - m['hss']; hbe = ht - m['hss']          # sync width; sync + back porch (blank end, counted from sync start)
@@ -143,11 +153,17 @@ def gen(m, outdir, edid=b'', dp=None):
     if dp:      # DisplayPort on the USB-C port: the DP templates with the same geometry, DP DTO, MSA and M/N for the link rate
         lanes, rate = dp
         fixed = captured and rate == 0x14 and lanes == 2
+        tpl = 'plan_dp_%s.txt'
+        if pipe == 2:     # the same tables at the pipe-2 addresses; HUBP2_DCHUBP_CNTL with VTG_SEL 2 (TTU off for other modes)
+            geo = {P2.get(r, r): f for r, f in geo.items() if r not in (0x16d, 0x5668, 0x566a, 0x566c, 0x565b)}
+            geo[0x3c6b] = lambda o: {0xf002b: 0xe1021, 0xf002a: 0xe1020}.get(o, o)
+            tpl = 'plan_dp2_%s.txt' 
         dpm = {0x145: pclk * 1000, 0x146: 598874000,                      # DP DTO: pixel clock over the 598.874 MHz reference, in Hz
                0x580c: ht << 16 | vt, 0x580d: hbe << 16 | vbe,
                0x580e: (0 if m['hpos'] else 1) << 31 | hsw << 16 | (0 if m['vpos'] else 1) << 15 | vsw, 0x580f: ha << 16 | va,
                0x57d2: round(32768 * pclk / (rate * 27000)), 0x57cb: lanes - 1}
-        for src, dst in (('plan_dp_pre.txt', 'dp_pre.txt'), ('plan_dp_post.txt', 'dp_post.txt'), ('plan_dp_plane.txt', 'dp_plane.txt')):
+        if pipe == 2: dpm = {P2.get(r, r): v for r, v in dpm.items()}
+        for src, dst in ((tpl % 'pre', 'dp_pre.txt'), (tpl % 'post', 'dp_post.txt'), (tpl % 'plane', 'dp_plane.txt')):
             out = []
             for ln in open(os.path.join(HERE, src)).read().split('\n'):
                 f = ln.split()
@@ -177,7 +193,9 @@ def gen(m, outdir, edid=b'', dp=None):
 
 if __name__ == '__main__':
     e = open(sys.argv[1], 'rb').read()
-    want = None; dp = None
+    want = None; dp = None; pipe = 1
+    if '--pipe' in sys.argv:               # --pipe 2: DisplayPort on display pipe 2 (beside HDMI on pipe 1)
+        i = sys.argv.index('--pipe'); pipe = int(sys.argv[i + 1]); del sys.argv[i:i + 2]
     if '--dp' in sys.argv:                 # --dp <lanes> <rate code>: the trained link; it bounds the pixel clock (8 bpc RGB)
         i = sys.argv.index('--dp'); dp = (int(sys.argv[i + 1]), int(sys.argv[i + 2], 0)); del sys.argv[i:i + 3]
         MAXCLK = int(dp[0] * dp[1] * 9000 * 0.97)      # lanes x rate x 0.27 Gbit/s x 8/10, over 24 bits a pixel, some margin
@@ -186,6 +204,6 @@ if __name__ == '__main__':
         w, h = size.split('x'); want = (int(w), int(h), float(r) if r else None)
     m = pick(e, want)
     os.makedirs(sys.argv[2], exist_ok=True)
-    cap, pitch = gen(m, sys.argv[2], e, dp)
+    cap, pitch = gen(m, sys.argv[2], e, dp, pipe)
     print('mode %dx%d@%.2f pclk %d kHz totals %dx%d pitch %d (%s)' % (m['ha'], m['va'], m['pclk'] * 1000 / (m['ht'] * m['vt']), m['pclk'], m['ht'], m['vt'],
           pitch, 'captured values' if cap else 'generated, firmware-style requests'))

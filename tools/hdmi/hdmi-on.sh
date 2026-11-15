@@ -17,9 +17,12 @@ fi
 SIG=plan_signal.txt; PL=plan_plane6.txt; AUD=plan_audio.txt
 [ "${MIRROR:-0}" = 1 ] && PL=plan_plane.txt
 [ -n "${PLANS:-}" ] && [ -f "$PLANS/plane.txt" ] && { SIG=$PLANS/signal.txt; PL=$PLANS/plane.txt; AUD=$PLANS/audio.txt; }
-for p in plan_init_off.txt $AUD $SIG $PL plan_fmt8.txt; do ./dmubboot run $p >/dev/null 2>&1 || { echo "$p failed"; exit 3; }; done
+# DisplayPort lit on pipe 2 (phxfb3): the plans' DPP clock DTO switch (0x176) must keep pipe 2's bit (8) on
+otg2=$(( $($P regs 0x5101 | awk '/^0x/{print $2}') & 1 ))
+run() { if [ $otg2 = 1 ] && grep -q '^w 176 10 ' $1; then sed 's/^w 176 10 /w 176 110 /' $1 > /tmp/hdmi-on-plan.txt; ./dmubboot run /tmp/hdmi-on-plan.txt; else ./dmubboot run $1; fi; }
+for p in plan_init_off.txt $AUD $SIG $PL plan_fmt8.txt; do run $p >/dev/null 2>&1 || { echo "$p failed"; exit 3; }; done
 $P wreg 0x5d28 0x80 >/dev/null; $P wreg 0x565c 0 >/dev/null
 $P wreg 0x124 $($P regs 0x124 | awk '/^0x/{print $2}') >/dev/null      # dccg314_trigger_dio_fifo_resync
-$P wreg 0x36b8 0x10080003 >/dev/null                                    # GPINT: streams 0 and 1 active
+./streams.sh                                                            # GPINT: the streams that run
 [ -n "${PLANS:-}" ] && [ -f "$PLANS/audio_on.txt" ] && ./dmubboot run $PLANS/audio_on.txt >/dev/null 2>&1    # audio endpoint on
 echo "HDMI on: BE_EN $($P regs 0x5672 | awk '/^0x/{print $2}') FE $($P regs 0x564b | awk '/^0x/{print $2}') FIFO $($P regs 0x5652 | awk '/^0x/{print $2}')" | tee -a $L

@@ -1,0 +1,9 @@
+# DP output off, part 2 (after the transmitter DISABLE): link registers back to idle, OTG2 off
+w 57d8 0 DP2_DP_DPHY_TRAINING_PATTERN_SEL
+w 57c8 0 DP2_DP_LINK_CNTL
+w 57cf 0 DP2_DP_DPHY_INTERNAL_CTRL
+w 57eb 0 DP2_DP_SEC_CNTL
+w 5751 1c DIG2_DIG_FIFO_CTRL0
+w 5771 20000000 DIG2_DIG_BE_CNTL
+w 5101 1200 OTG2_OTG_CONTROL
+w 397d 0 DCHUBBUB_DET2_CTRL (give the detile buffer back)

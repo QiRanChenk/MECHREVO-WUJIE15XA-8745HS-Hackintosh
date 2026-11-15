@@ -96,7 +96,7 @@ tools/hdmi/          HDMI 外接显示器：点亮 HDMI 口、热插拔、按 ED
 
 ## 外接显示器（HDMI 口 / USB-C 口）
 
-nullarc 0.4.0 只驱动内屏。这里让机身 HDMI 口和 USB-C 口（DP 交替模式，例如 USB-C 转 HDMI 转接器）成为 macOS 里真正的第二块屏（扩展桌面、热插拔、显示器休眠、合盖外接）。两个口共用显示管线 1，同一时间只能点亮其中一个。
+nullarc 0.4.0 只驱动内屏。这里让机身 HDMI 口和 USB-C 口（DP 交替模式，例如 USB-C 转 HDMI 转接器）成为 macOS 里真正的第二块屏（扩展桌面、热插拔、显示器休眠、合盖外接）。再加 boot-arg `phxfb3=1` 时两个口可以各接一台、同时点亮（HDMI 用显示管线 1，USB-C 用管线 2，各有自己的帧缓冲）；不加时两个口共用管线 1，同一时间只能点亮其中一个。
 
 组成：
 
@@ -162,4 +162,4 @@ Source patches for the modified GPL/BSD kexts are in `patches/`.
 
 ### External display (HDMI)
 
-The HDMI port and DisplayPort on the USB-C port (DP alt mode, one of them at a time) work as a real second display (extended desktop, hot-plug, display sleep, clamshell). It needs the `hdmi-fb2` branch of [QiRanChenk/nullarc](https://github.com/QiRanChenk/nullarc) (PhxAccel with a second framebuffer, boot-arg `phxfb2=1`) and `tools/hdmi` (a root daemon that loads Linux's DMUB firmware, programs display pipe 1 from the monitor's EDID and reports the mode to the framebuffer). Limits: 8 bpc RGB, pixel clock up to 340 MHz, HDMI audio through VoodooHDA restricted to the Radeon audio function, tested on this DCN 3.1.4 machine with two monitors only. See the Chinese section above for the details and pitfalls.
+The HDMI port and DisplayPort on the USB-C port (DP alt mode; both at once with the boot-arg `phxfb3=1`, otherwise one at a time) work as a real second display (extended desktop, hot-plug, display sleep, clamshell). It needs the `hdmi-fb2` branch of [QiRanChenk/nullarc](https://github.com/QiRanChenk/nullarc) (PhxAccel with a second framebuffer, boot-arg `phxfb2=1`) and `tools/hdmi` (a root daemon that loads Linux's DMUB firmware, programs display pipe 1 from the monitor's EDID and reports the mode to the framebuffer). Limits: 8 bpc RGB, pixel clock up to 340 MHz, HDMI audio through VoodooHDA restricted to the Radeon audio function, tested on this DCN 3.1.4 machine with two monitors only. See the Chinese section above for the details and pitfalls.

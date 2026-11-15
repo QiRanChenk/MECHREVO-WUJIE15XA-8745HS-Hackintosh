@@ -16,7 +16,8 @@ for i in $(seq 1 60); do sysctl -n debug.phx_cppc_supported >/dev/null 2>&1 && b
 #   /Users/Shared/cppc/gfxoff-off   present = leave GFXOFF alone; absent = keep debug.phx_pm_gfxoff at 1 (the kext's
 #                              sysctl does not survive a reboot)
 #   /Users/Shared/cppc/gpu     the 780M's clock cap (SMU SetSoftMaxGfxClk): "auto" = 800 MHz on the panel alone, 1600 MHz
-#                              while a monitor is lit on the HDMI port (two 2.5K displays stutter at 800); or a number
+#                              while an external monitor is lit (two 2.5K displays stutter at 800), 2000 MHz with one on
+#                              each port (HDMI and USB-C); or a number
 #                              800-2600 (2600 = what the firmware allows without a cap; higher caps cost idle power).
 #                              Written again 45 s and 120 s after the start and after a wake: the boot and wake scripts
 #                              set their own value first. What is in force goes to /Users/Shared/cppc/gpu-status.
@@ -41,7 +42,8 @@ while :; do
     fi
     g=auto; [ -r $D/gpu ] && read -r g < $D/gpu
     case "$g" in
-        ''|*[!0-9]*) gmode=auto; cap=800; [ $(( $(sysctl -n debug.phxfb1_hw 2>/dev/null || echo 0) & 2 )) = 2 ] && cap=1600 ;;
+        ''|*[!0-9]*) gmode=auto; hw=$(sysctl -n debug.phxfb1_hw 2>/dev/null || echo 0); [ "$hw" -lt 0 ] && hw=0
+                     cap=800; [ $(( hw & 34 )) != 0 ] && cap=1600; [ $(( hw & 34 )) = 34 ] && cap=2000 ;;
         *) gmode=manual; cap=$g; [ "$cap" -lt 800 ] && cap=800; [ "$cap" -gt 2600 ] && cap=2600 ;;
     esac
     [ $woke = 1 ] && ticks=0
