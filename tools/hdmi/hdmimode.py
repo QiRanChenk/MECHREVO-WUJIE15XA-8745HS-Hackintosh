@@ -70,9 +70,11 @@ def audio_endpoint(e, dp=False):
     for o in range(54, 126, 18):
         if e[o:o + 3] == b'\0\0\0' and e[o + 3] == 0xfc: name = e[o + 5:o + 18].split(b'\n')[0].rstrip()
     name = name[:16]
-    ir = 0x3852 if dp else 0x384c       # the HDMI port's encoder uses endpoint 1, the USB-C DP one endpoint 2
+    # Endpoint 1 for both ports (Linux gave the USB-C DP encoder endpoint 2): VoodooHDA plays to the codec pin of
+    # endpoint 1 whatever port the monitor is on, and through endpoint 2 the monitor stayed silent (2026-11-15).
+    ir = 0x384c
     w = lambda idx, val, note='': ['w %x %x AZF0ENDPOINT_INDEX' % (ir, idx), 'w %x %x AZF0ENDPOINT_DATA %s' % (ir + 1, val, note)]
-    pre = ['# audio endpoint %d: sink capabilities and name (from the EDID)' % (2 if dp else 1)]
+    pre = ['# audio endpoint 1: sink capabilities and name (from the EDID)']
     for v in (0x80000001, 1, 0, 1): pre += w(0x54, v, 'hot plug control')
     pre += w(0x25, (0x20000 if dp else 0x10000) | spk, 'speaker allocation, ' + ('DP' if dp else 'HDMI')) + w(0x27, 0)
     pre += w(0x28, (sad[0] & 7) | sad[1] << 8 | sad[2] << 16 | sad[1] << 24, 'LPCM: channels - 1, rates, sample sizes')
@@ -155,10 +157,10 @@ def gen(m, outdir, edid=b'', dp=None):
                 out.append('w %x %x %s' % (reg, new & 0xffffffff, ' '.join(f[3:])))
             open(os.path.join(outdir, dst), 'w').write('\n'.join(out))
         ep = audio_endpoint(edid, True) if len(edid) >= 256 else None
-        if ep:      # DP audio as Linux sets it: audio DTO1 from the DP reference clock, AFMT2 fed by endpoint 2, DP secondary data packets
+        if ep:      # DP audio as Linux sets it: audio DTO1 from the DP reference clock, AFMT2 fed by endpoint 1, DP secondary data packets
             a = ['# DP audio: audio DTO1 (48 kHz family over the 598.874 MHz DP reference), AFMT2', 'w 3521 0 DCCG_AUDIO_DTBCLK_DTO_PHASE', 'w 3522 0 DCCG_AUDIO_DTBCLK_DTO_MODULO',
                  'w 16b 100030 DCCG_AUDIO_DTO_SOURCE', 'w 16b 100010 DCCG_AUDIO_DTO_SOURCE', 'w 16f 5b6184 DCCG_AUDIO_DTO1_MODULE', 'w 16e 3a980 DCCG_AUDIO_DTO1_PHASE',
-                 'w 5745 2 AFMT2_AFMT_AUDIO_SRC_CONTROL', 'w 5735 300 AFMT2_AFMT_AUDIO_PACKET_CONTROL2']
+                 'w 5745 1 AFMT2_AFMT_AUDIO_SRC_CONTROL', 'w 5735 300 AFMT2_AFMT_AUDIO_PACKET_CONTROL2']
             b = ['# DP audio on: secondary data packets (audio stream, timestamp, info frame)', 'w 5770 1 DIG2_AFMT_CNTL', 'w 57f1 8000 DP2_DP_SEC_AUD_N', 'w 57f5 1 DP2_DP_SEC_TIMESTAMP',
                  'w 5747 101 AFMT2_AFMT_MEM_PWR', 'w 5742 4000800 AFMT2_AFMT_AUDIO_PACKET_CONTROL', 'w 5735 300 AFMT2_AFMT_AUDIO_PACKET_CONTROL2', 'w 5743 80 AFMT2_AFMT_INFOFRAME_CONTROL0',
                  'w 5738 0 AFMT2_AFMT_60958_0', 'w 57eb 10 DP2_DP_SEC_CNTL', 'w 57eb 1110 DP2_DP_SEC_CNTL', 'w 57eb 1111 DP2_DP_SEC_CNTL', 'w 5747 1 AFMT2_AFMT_MEM_PWR',
