@@ -15,7 +15,12 @@ for i in $(seq 1 60); do sysctl -n debug.phx_cppc_supported >/dev/null 2>&1 && b
 #   /Users/Shared/cppc/lid     "awake" = closing the lid does not sleep (pmset disablesleep 1); anything else = it does
 #   /Users/Shared/cppc/gfxoff-off   present = leave GFXOFF alone; absent = keep debug.phx_pm_gfxoff at 1 (the kext's
 #                              sysctl does not survive a reboot)
-last=""; n=0; src=""; lidlast=""; prev=""
+#   /Users/Shared/cppc/gpu     the 780M's clock cap (SMU SetSoftMaxGfxClk): "auto" = 800 MHz on the panel alone, 1600 MHz
+#                              while a monitor is lit on the HDMI port (two 2.5K displays stutter at 800); or a number
+#                              800-2600 (2600 = what the firmware allows without a cap; higher caps cost idle power).
+#                              Written again 45 s and 120 s after the start and after a wake: the boot and wake scripts
+#                              set their own value first. What is in force goes to /Users/Shared/cppc/gpu-status.
+last=""; n=0; src=""; lidlast=""; prev=""; glast=""; ticks=0
 while :; do
     m=auto; v=; [ -r $D/mode ] && read -r m v < $D/mode
     # the power source every third round, the mode file every round: a choice in the menu applies within a second
@@ -33,6 +38,18 @@ while :; do
         sysctl -w debug.phx_cppc_apply=1 >/dev/null 2>&1
         echo "$mode $epp $src" > $D/status.tmp && mv $D/status.tmp $D/status; chmod 644 $D/status
         last=$epp; n=0
+    fi
+    g=auto; [ -r $D/gpu ] && read -r g < $D/gpu
+    case "$g" in
+        ''|*[!0-9]*) gmode=auto; cap=800; [ $(( $(sysctl -n debug.phxfb1_hw 2>/dev/null || echo 0) & 2 )) = 2 ] && cap=1600 ;;
+        *) gmode=manual; cap=$g; [ "$cap" -lt 800 ] && cap=800; [ "$cap" -gt 2600 ] && cap=2600 ;;
+    esac
+    [ $woke = 1 ] && ticks=0
+    ticks=$((ticks + 1))
+    if [ "$cap" != "$glast" ] || [ $ticks = 45 ] || [ $ticks = 120 ]; then
+        if [ "$(sysctl -n debug.nvaccel_iop_ok 2>/dev/null || echo 0)" != 0 ] && /Users/Shared/gpu/phxctl/phxctl smu 0x1b $cap >/dev/null 2>&1; then
+            glast=$cap; echo "$gmode $cap" > $D/gpu-status.tmp && mv $D/gpu-status.tmp $D/gpu-status; chmod 644 $D/gpu-status
+        fi
     fi
     lid=sleep; [ -r $D/lid ] && read -r lid < $D/lid
     [ "$lid" = awake ] || lid=sleep

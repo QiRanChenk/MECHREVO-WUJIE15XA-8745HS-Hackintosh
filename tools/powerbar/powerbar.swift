@@ -185,6 +185,25 @@ final class App: NSObject, NSApplicationDelegate {
             volSlider.doubleValue = Double(pct); volLabel.stringValue = volText(pct)
         }
     }
+    // the 780M's clock cap, applied by the root service cppcd (/Users/Shared/cppc/gpu: "auto" or MHz)
+    let gpuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    let gpuMenu = NSMenu()
+    let gpuChoices: [(zh: String, en: String, value: String)] = [
+        ("自动（单屏 800 · 外接屏 1600 MHz）", "Automatic (800 MHz alone, 1600 with an external display)", "auto"),
+        ("800 MHz（最省电）", "800 MHz (lowest power)", "800"), ("1200 MHz", "1200 MHz", "1200"), ("1600 MHz", "1600 MHz", "1600"),
+        ("2000 MHz", "2000 MHz", "2000"), ("2600 MHz（不限制，最耗电）", "2600 MHz (no cap, highest power)", "2600")]
+    @objc func pickGpu(_ s: NSMenuItem) {
+        try? FileManager.default.createDirectory(atPath: modeDir, withIntermediateDirectories: true)
+        try? (gpuChoices[s.tag].value + "\n").write(toFile: modeDir + "/gpu", atomically: true, encoding: .utf8)
+        refreshGpu()
+    }
+    func refreshGpu() {
+        let want = ((try? String(contentsOfFile: modeDir + "/gpu", encoding: .utf8)) ?? "auto").trimmingCharacters(in: .whitespacesAndNewlines)
+        for (i, it) in gpuMenu.items.enumerated() { it.state = gpuChoices[i].value == want || (i == 0 && Int(want) == nil) ? .on : .off; it.title = L(gpuChoices[i].zh, gpuChoices[i].en) }
+        let st = ((try? String(contentsOfFile: modeDir + "/gpu-status", encoding: .utf8)) ?? "").split(whereSeparator: { $0 == " " || $0 == "\n" }).map(String.init)
+        if st.count >= 2 { gpuItem.title = L("核显频率上限：\(st[1]) MHz（\(st[0] == "auto" ? "自动" : "手动")）", "GPU clock cap: \(st[1]) MHz (\(st[0] == "auto" ? "auto" : "manual"))") }
+        else { gpuItem.title = L("核显频率上限", "GPU clock cap") }
+    }
     var modeItems: [NSMenuItem] = []
     let modeLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let slider = NSSlider(value: 128, minValue: 0, maxValue: 255, target: nil, action: nil)
@@ -242,6 +261,11 @@ final class App: NSObject, NSApplicationDelegate {
         box.addSubview(sliderLabel); box.addSubview(slider)
         let sl = NSMenuItem(); sl.view = box; menu.addItem(sl)
         menu.addItem(.separator())
+        for (i, c) in gpuChoices.enumerated() {
+            let it = NSMenuItem(title: L(c.zh, c.en), action: #selector(pickGpu(_:)), keyEquivalent: "")
+            it.target = self; it.tag = i; gpuMenu.addItem(it)
+        }
+        gpuItem.submenu = gpuMenu; menu.addItem(gpuItem); menu.addItem(.separator())
         let ebox = NSView(frame: NSRect(x: 0, y: 0, width: 330, height: 46))
         extLabel.frame = NSRect(x: 20, y: 26, width: 290, height: 16)
         extLabel.font = NSFont.menuFont(ofSize: 11); extLabel.textColor = .secondaryLabelColor; extLabel.alignment = .center
@@ -300,6 +324,7 @@ final class App: NSObject, NSApplicationDelegate {
         } else { cpuLine.title = L("读不到 CPU 功耗", "No CPU power data") }
         item.button?.title = title
         refreshMode()
+        refreshGpu()
         refreshExt()
         trackPanel()
         lidItem.state = lidAwake() ? .on : .off

@@ -109,7 +109,7 @@ nullarc 0.4.0 只驱动内屏。这里让机身 HDMI 口成为 macOS 里真正�
 
 HDMI 声音：`hdmimode.py` 按 EDID 写好 HDMI 口的音频端点（显示器的音频能力和名称，和 Linux 写的一致），核显的 HD-audio 设备（1002:1640）由 [VoodooHDA](https://github.com/CloverHackyColor/VoodooHDA) 3.6.8 驱动：把它的 Info.plist 改成只匹配 `IOPCIMatch = 0x16401002`（这样不碰内置声卡），放进 `/Library/Extensions` 并重建辅助内核集合。不要用引导器注入版（VoodooHDA_BL）：它自带一份 IOAudioFamily，会让 SimpleHDA 带的内置声卡失效。HDMI 是数字输出，系统音量键不起作用，powerbar 里有"外接显示器音量"（DDC/CI，VCP 0x62）。
 
-两块 2.5K 屏在 800 MHz 的核显限频下会卡，`hdmid` 在外接屏点亮时把上限提到 1600 MHz（`/Users/Shared/gpu/hdmi/gfxclk` 可改），拔掉后回到 800。
+两块 2.5K 屏在 800 MHz 的核显限频下会卡，`cppcd` 在外接屏点亮时把上限提到 1600 MHz，拔掉后回到 800；也可以在 powerbar 的"核显频率上限"里手动选 800～2600 MHz。
 
 安装：把 linux-firmware 的 `amdgpu/dcn_3_1_4_dmcub.bin` 和本机的 `vbios.bin`（Linux 下 `/sys/kernel/debug/dri/0/amdgpu_vbios`）放进 `tools/hdmi/`，然后 `sudo tools/hdmi/install.sh`。需要 boot-arg `phxdebug=1` 和带"不回读写寄存器"的 PhxBringup（同一 fork 的 `test14` 分支起）。
 

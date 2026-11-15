@@ -5,6 +5,7 @@
 #   macOS put the display to sleep for 6 s       -> hdmi-off.sh (the monitor goes to standby); lit again on wake
 # After a wake from hibernation the port is dark again (the display block was reset): same path as a plug.
 # The state comes from the kext (sysctl debug.phxfb1_hw / _power), so polling does not wake the GPU.
+# (The 780M's clock cap follows the monitor too: the cppcd service raises it while the port is lit.)
 # LaunchDaemon local.hdmid; log /var/log/hdmid.log; `touch /Users/Shared/gpu/hdmi/off` pauses it.
 D=/Users/Shared/gpu/hdmi; cd $D || exit 1
 exec >>/var/log/hdmid.log 2>&1
@@ -57,9 +58,6 @@ bright_apply() {
   apply brightness 0x10 $vmax && { cur=$v; put_state; }
   apply volume 0x62 $amax && { acur=$v; put_state; }
 }
-# The 780M's clock cap: 800 MHz saves power on the panel alone (tools/gpuclk), but two 2.5K displays stutter at it;
-# 1600 MHz while a monitor is lit. $D/gfxclk holds another value for that case.
-gfxclk() { /Users/Shared/gpu/phxctl/phxctl smu 0x1b $1 >/dev/null 2>&1; say "GFX clock cap $1 MHz"; }
 say "hdmid start"
 dark=0; n=0; bs=0; hot=0
 while :; do
@@ -77,11 +75,10 @@ while :; do
     if busy || [ $(( $(sysctl -n debug.nvaccel_heads_piped 2>/dev/null || echo 0) & 2 )) = 0 ]; then sleep 2; continue; fi
     sleep 1; [ $(( $(sysctl -n debug.phxfb1_hw) & 1 )) = 1 ] || continue
     say "monitor on the HDMI port (hw $hw): lighting"; light; say "-> hw $(sysctl -n debug.phxfb1_hw), $(./fb1cfg show)"
-    gfxclk $(cat $D/gfxclk 2>/dev/null || echo 1600)
     bs=0
   elif [ $hpd = 0 ] && { [ $lit = 1 ] || online; }; then
     sleep 1; [ $(( $(sysctl -n debug.phxfb1_hw) & 1 )) = 0 ] || continue
-    say "monitor gone (hw $hw)"; ./fb1cfg offline >/dev/null; ./hdmi-off.sh; rm -f $S/state; vmax=0; bs=0; gfxclk 800
+    say "monitor gone (hw $hw)"; ./fb1cfg offline >/dev/null; ./hdmi-off.sh; rm -f $S/state; vmax=0; bs=0
   elif [ $lit = 1 ] && [ $dark = 3 ]; then
     say "display sleep: port off"; ./hdmi-off.sh
   fi
