@@ -3,6 +3,8 @@
 // CPU: AMDRyzenCPUPowerManagement user client selector 4 (first float = package watts).
 // CPU mode: writes the choice to /Users/Shared/cppc/mode ("auto" or "epp <0-255>"); the root service cppcd applies it
 // through PhxCPPC.kext (AMD CPPC energy-performance preference) and reports in /Users/Shared/cppc/status.
+// External monitor: /Users/Shared/hdmi/state ("<brightness> <max>", written by the root service hdmid while a monitor
+// on the HDMI port answers DDC/CI) shows a brightness slider; the choice goes to /Users/Shared/hdmi/brightness.
 import Cocoa
 import IOKit
 
@@ -85,6 +87,7 @@ final class App: NSObject, NSApplicationDelegate {
     func sliderText(_ v: Int) -> String { L("性能 ← \(v) → 省电", "Performance ← \(v) → Saver") }
     @objc func toggleLanguage() {
         english.toggle(); UserDefaults.standard.set(english, forKey: "english")
+        extSetAt = Date.distantPast
         relabel(); tick()
     }
     func relabel() {
@@ -92,6 +95,71 @@ final class App: NSObject, NSApplicationDelegate {
         langItem.title = english ? "中文" : "English"
         lidItem.title = L("合盖不休眠（继续运行）", "Keep running with the lid closed")
         quitItem.title = L("退出 powerbar", "Quit powerbar")
+    }
+    // the external monitor's own brightness (DDC/CI), applied by the root service hdmid
+    let extDir = "/Users/Shared/hdmi"
+    let extSlider = NSSlider(value: 50, minValue: 0, maxValue: 100, target: nil, action: nil)
+    let extLabel = NSTextField(labelWithString: "")
+    let extItem = NSMenuItem()
+    var extWrite: Timer? = nil
+    var extSetAt = Date.distantPast
+    func extText(_ v: Int) -> String { L("外接显示器亮度 \(v)%", "External display brightness \(v)%") }
+    var extSentAt = Date.distantPast
+    @objc func extSlid(_ s: NSSlider) {
+        let v = Int(s.doubleValue.rounded())
+        extLabel.stringValue = extText(v); extSetAt = Date()
+        // follow the drag: a value goes out at once, at most one every 0.12 s (a DDC/CI write takes about that long),
+        // and the one the slider settles on always does
+        extWrite?.invalidate()
+        let send = { try? "\(v)\n".write(toFile: self.extDir + "/brightness", atomically: true, encoding: .utf8); self.extSentAt = Date() }
+        let since = Date().timeIntervalSince(extSentAt)
+        if since >= 0.12 { send() }
+        else {
+            let t = Timer(timeInterval: 0.12 - since, repeats: false) { _ in send() }
+            RunLoop.main.add(t, forMode: .common); extWrite = t
+        }
+    }
+    // The panel's brightness across the lid. Beside an external monitor the panel leaves the desktop while the lid is
+    // closed; when it comes back corebrightnessd starts over at full brightness in its books (the slider) without
+    // touching the panel, which the driver has put back at its old level. The level from before the lid closed is
+    // set again through DisplayServices, so the slider and the panel agree.
+    typealias DSGet = @convention(c) (UInt32, UnsafeMutablePointer<Float>) -> Int32
+    typealias DSSet = @convention(c) (UInt32, Float) -> Int32
+    let ds = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_LAZY)
+    var panelLevel: Float? = nil
+    var lidWasClosed = false
+    var restoreTries = 0
+    func builtinDisplay() -> UInt32? {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 8); var n: UInt32 = 0
+        guard CGGetOnlineDisplayList(8, &ids, &n) == .success else { return nil }
+        return ids.prefix(Int(n)).first { CGDisplayIsBuiltin($0) != 0 }
+    }
+    func lidClosed() -> Bool {
+        let root = IORegistryEntryFromPath(kIOMainPortDefault, "IOPower:/IOPowerConnection/IOPMrootDomain")
+        guard root != 0 else { return false }
+        defer { IOObjectRelease(root) }
+        return (IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Bool) ?? false
+    }
+    func trackPanel() {
+        guard let ds = ds, let g = dlsym(ds, "DisplayServicesGetBrightness"), let p = dlsym(ds, "DisplayServicesSetBrightness") else { return }
+        let get = unsafeBitCast(g, to: DSGet.self), set = unsafeBitCast(p, to: DSSet.self)
+        let closed = lidClosed()
+        if closed { lidWasClosed = true; restoreTries = 0; return }
+        guard let d = builtinDisplay() else { return }          // not back on the desktop yet
+        if lidWasClosed {
+            if let want = panelLevel, restoreTries < 2 { _ = set(d, want); restoreTries += 1; return }
+            lidWasClosed = false
+        }
+        var v: Float = 0
+        if get(d, &v) == 0, v > 0.004 { panelLevel = v }
+    }
+    func refreshExt() {
+        let st = ((try? String(contentsOfFile: extDir + "/state", encoding: .utf8)) ?? "").split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int($0) }
+        extItem.isHidden = st.count < 2 || st[1] <= 0
+        if st.count >= 2, st[1] > 0, Date().timeIntervalSince(extSetAt) > 5 {   // not under the user's hand
+            let pct = Int((Double(st[0]) * 100 / Double(st[1])).rounded())
+            extSlider.doubleValue = Double(pct); extLabel.stringValue = extText(pct)
+        }
     }
     var modeItems: [NSMenuItem] = []
     let modeLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -150,6 +218,13 @@ final class App: NSObject, NSApplicationDelegate {
         box.addSubview(sliderLabel); box.addSubview(slider)
         let sl = NSMenuItem(); sl.view = box; menu.addItem(sl)
         menu.addItem(.separator())
+        let ebox = NSView(frame: NSRect(x: 0, y: 0, width: 330, height: 46))
+        extLabel.frame = NSRect(x: 20, y: 26, width: 290, height: 16)
+        extLabel.font = NSFont.menuFont(ofSize: 11); extLabel.textColor = .secondaryLabelColor; extLabel.alignment = .center
+        extSlider.frame = NSRect(x: 20, y: 4, width: 290, height: 22)
+        extSlider.target = self; extSlider.action = #selector(extSlid(_:)); extSlider.isContinuous = true
+        ebox.addSubview(extLabel); ebox.addSubview(extSlider)
+        extItem.view = ebox; extItem.isHidden = true; menu.addItem(extItem)
         lidItem.target = self; lidItem.action = #selector(toggleLid); lidItem.state = lidAwake() ? .on : .off
         menu.addItem(lidItem); menu.addItem(.separator())
         langItem.target = self; langItem.action = #selector(toggleLanguage)
@@ -194,6 +269,8 @@ final class App: NSObject, NSApplicationDelegate {
         } else { cpuLine.title = L("读不到 CPU 功耗", "No CPU power data") }
         item.button?.title = title
         refreshMode()
+        refreshExt()
+        trackPanel()
         lidItem.state = lidAwake() ? .on : .off
     }
 }

@@ -1,0 +1,5 @@
+# as Linux does at driver init for the unused HDMI PHY: transmitter B off, then PLL1 (PHY B PLL) off (pixel clock 0, force, no CRTC)
+d 000300013c000180 f60c000200000000
+s 100
+d 0000000010000280 000000ff010f0015
+s 100

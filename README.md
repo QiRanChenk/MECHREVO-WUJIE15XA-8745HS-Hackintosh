@@ -41,6 +41,7 @@ tools/powerbar/      菜单栏显示充放电功耗、SoC 功耗、温度、预�
 tools/cppc/          CPU 调频服务：开机启用 AMD CPPC，按 powerbar 里选的模式设置能效偏好（需 nullarc PR #21 的 PhxCPPC.kext）
 tools/ryzenstat/     读 MSR / 每核功耗的小工具（需本仓库补丁版 CPU kext）
 tools/brightkeep/    记住屏幕亮度 + 熄屏时关闭背光
+tools/hdmi/          HDMI 外接显示器：点亮 HDMI 口、热插拔、按 EDID 选分辨率、DDC/CI 调显示器亮度（见下文"外接显示器"）
 ```
 
 ## 需要自行下载的文件
@@ -94,6 +95,31 @@ tools/brightkeep/    记住屏幕亮度 + 熄屏时关闭背光
 
 注意：唤醒需要按电源键；不要带 `-v` / `debug=0x100` 测试休眠（入睡时会卡死）；一次失败的睡眠可能让 MT7922 无线网卡失灵，需彻底断电（关机、拔电源、长按电源键 20 秒）才能恢复。
 
+## 外接显示器（HDMI）
+
+nullarc 0.4.0 只驱动内屏。这里让机身 HDMI 口成为 macOS 里真正的第二块屏（扩展桌面、热插拔、显示器休眠、合盖外接）。USB-C 输出没有做。
+
+组成：
+
+1. **PhxAccel 第二个帧缓冲**：[QiRanChenk/nullarc](https://github.com/QiRanChenk/nullarc) 的 `hdmi-fb2` 分支，boot-arg `phxfb2=1`（config.plist 已含；没有这版 PhxAccel 时该参数无效果）。内核扩展不写任何显示寄存器，只提供帧缓冲、EDID、连接事件和 VBL 定时器。
+2. **`tools/hdmi`**（root 服务 `hdmid`）：每 2 秒看一次 HDMI 热插拔线；插入时用 GPIO 位操作读 EDID（`ddcbb`），按首选时序生成寄存器序列（`hdmimode.py`），通过 PSP 载入 Linux 的 DMUB 固件并重启 DMCUB（`dmubboot`），点亮显示管线 1（`hdmi-on.sh`），再把模式和 EDID 告诉帧缓冲（`fb1cfg`）。拔出、显示器休眠时关闭输出。
+3. **powerbar**：菜单里多一条"外接显示器亮度"（DDC/CI，VCP 0x10）。
+
+限制：8 位色 RGB，像素时钟不超过 340 MHz（2560x1440@75、3440x1440@60 可用，4K60 不行）；没有 HDMI 声音；只在本机的 DCN 3.1.4 上验证过两台显示器。想指定分辨率：把一行如 `2560x1440@60` 写进 `/Users/Shared/gpu/hdmi/mode` 后重插。
+
+安装：把 linux-firmware 的 `amdgpu/dcn_3_1_4_dmcub.bin` 和本机的 `vbios.bin`（Linux 下 `/sys/kernel/debug/dri/0/amdgpu_vbios`）放进 `tools/hdmi/`，然后 `sudo tools/hdmi/install.sh`。需要 boot-arg `phxdebug=1` 和带"不回读写寄存器"的 PhxBringup（同一 fork 的 `test14` 分支起）。
+
+几个值得记下的坑：
+
+- macOS 下运行的是固件（GOP）自带的 DMUB，它不会点亮 HDMI；必须换成 Linux 的 DAL 固件，PHY/PLL 只能由它通过 3 条 VBIOS 类命令编程。
+- 启用前要先像 Linux 初始化那样把发射器和 PLL 关一次，否则固件走另一条分支，显示器锁不住。
+- 链路使能后要重写一次 `DENTIST_DISPCLK_CNTL`（DIO FIFO 重同步）。
+- PhxBringup 的调试写寄存器会回读，回读会打乱自增数据寄存器（信息帧 RAM、I2C 数据），导致 AVI 信息帧损坏、个别显示器黑屏。
+- DCN 的硬件 I2C 引擎在 macOS 下会让机器复位，DDC 改用 GPIO 位操作。
+- 非采集分辨率不需要移植 DML：按固件给内屏管线用的方式（TTU 关闭、DLG 参数清零）即可。
+
+合盖相关（都在上面的 PhxAccel 分支、`WujieSleepPolicy` 和 powerbar 里）：接着外接屏合盖时内屏下线、开盖恢复并找回亮度；合盖时关闭键盘灯（EC RAM 0x078c 的高 3 位是档位，经 WMI 的 RKBC/WKBC 读写），开盖恢复。
+
 ## 本仓库的修改
 
 - **AirportMtkWlan**（上游 [Arxusion/AirportMtkWlan](https://github.com/Arxusion/AirportMtkWlan) `fe9db22`，GPL-3.0）：`mwx_dma_tx_cleanup` 中断与固件下载并发重入导致 double free / 开机卡死，加 `OSCompareAndSwap` 重入保护和下标检查。见 `patches/airportmtkwlan-txcleanup-fix-v2.patch`。构建：`AIRPORT_OS=tahoe ./build-macos.sh Release AirportMtkWlan`。
@@ -127,3 +153,8 @@ SMBIOS fields are blank: generate your own for `MacBookPro16,1`.
 Source patches for the modified GPL/BSD kexts are in `patches/`.
 `WujieXhciIntx.kext` (source in `src/`) switches the AMD xHCI controllers from MSI to legacy INTx so HID events raise interrupts without polling (`phxkick=0 wujiexhci=1`).
 `tools/gpucg` enables 780M clock gating (about 2 W less at idle). Do not keep `debug=0x100` for daily use: a panic then halts with all cores spinning and drains the battery.
+
+
+### External display (HDMI)
+
+The HDMI port works as a real second display (extended desktop, hot-plug, display sleep, clamshell). It needs the `hdmi-fb2` branch of [QiRanChenk/nullarc](https://github.com/QiRanChenk/nullarc) (PhxAccel with a second framebuffer, boot-arg `phxfb2=1`) and `tools/hdmi` (a root daemon that loads Linux's DMUB firmware, programs display pipe 1 from the monitor's EDID and reports the mode to the framebuffer). Limits: 8 bpc RGB, pixel clock up to 340 MHz, no HDMI audio, tested on this DCN 3.1.4 machine with two monitors only. See the Chinese section above for the details and pitfalls.

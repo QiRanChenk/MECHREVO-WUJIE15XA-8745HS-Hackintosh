@@ -113,6 +113,82 @@ static int ecRegNow(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req
     return 0;
 }
 SYSCTL_PROC(_debug, OID_AUTO, wujiesleep_ecreg_now, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, ecRegNow, "I", "write 1: evaluate the EC's _REG(3, 1) now");
+// EC RAM through the firmware's WMI device (AMW0, PNP0C14): RKBC(addr low, addr high) returns a buffer whose first byte
+// is the value, WKBC(addr low, addr high, value, 0) writes one. The keyboard backlight is a field there (Uniwill EC).
+static IOACPIPlatformDevice *wmiDevice(void) {
+    static IOACPIPlatformDevice *dev;
+    if (dev) return dev;
+    OSDictionary *m = IOService::nameMatching("PNP0C14");
+    OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+    if (m) m->release();
+    while (OSObject *o = it ? it->getNextObject() : nullptr) {
+        IOService *svc = OSDynamicCast(IOService, o);
+        if (!svc || !svc->metaCast("IOACPIPlatformDevice")) continue;
+        IOACPIPlatformDevice *d = static_cast<IOACPIPlatformDevice *>(svc);
+        if (d->validateObject("RKBC") == kIOReturnSuccess && d->validateObject("WKBC") == kIOReturnSuccess) { d->retain(); dev = d; break; }
+    }
+    if (it) it->release();
+    return dev;
+}
+static int ecRamRead(unsigned addr) {
+    IOACPIPlatformDevice *d = wmiDevice();
+    if (!d) return -1;
+    OSObject *args[2] = { OSNumber::withNumber(addr & 0xff, 32), OSNumber::withNumber(addr >> 8 & 0xff, 32) }, *res = nullptr;
+    int v = -2;
+    if (args[0] && args[1] && d->evaluateObject("RKBC", &res, args, 2) == kIOReturnSuccess)
+        if (OSData *b = OSDynamicCast(OSData, res)) if (b->getLength() >= 1) v = *(const uint8_t *)b->getBytesNoCopy();
+    for (OSObject *a : args) if (a) a->release();
+    if (res) res->release();
+    return v;
+}
+static int ecRamWrite(unsigned addr, unsigned val) {
+    IOACPIPlatformDevice *d = wmiDevice();
+    if (!d) return -1;
+    OSObject *args[4] = { OSNumber::withNumber(addr & 0xff, 32), OSNumber::withNumber(addr >> 8 & 0xff, 32), OSNumber::withNumber(val & 0xff, 32),
+                          OSNumber::withNumber(0ull, 32) };
+    const bool ok = args[0] && args[1] && args[2] && args[3] && d->evaluateObject("WKBC", nullptr, args, 4) == kIOReturnSuccess;
+    for (OSObject *a : args) if (a) a->release();
+    return ok ? 0 : -2;
+}
+static int gEcAddr = 0x078c;
+SYSCTL_INT(_debug, OID_AUTO, wujie_ec_addr, CTLFLAG_RW, &gEcAddr, 0, "EC RAM address debug.wujie_ec_val reads and writes");
+static int ecVal(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+    int v = req->newptr ? 0 : ecRamRead((unsigned)gEcAddr);
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    return ecRamWrite((unsigned)gEcAddr, (unsigned)v) ? EIO : 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, wujie_ec_val, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, ecVal, "I", "the EC RAM byte at debug.wujie_ec_addr (through the WMI device's RKBC/WKBC)");
+
+// The keyboard backlight with the lid closed. Beside an external monitor the Mac keeps running with the lid closed
+// (clamshell), and the EC left the keyboard lit under it. Its level is bits 5-7 of EC RAM 0x078c (0 = off .. 4), written
+// with bit 4 set so the EC applies it. On a lid close the level is saved and set to 0, on open (or the first wake with
+// the lid open) it comes back. -wujienokbdlid leaves the light alone.
+static const unsigned kKbdReg = 0x078c;
+static int gKbdSaved = -1, gKbdLidEvents;
+static volatile bool gLidClosed;
+SYSCTL_INT(_debug, OID_AUTO, wujie_kbd_saved, CTLFLAG_RD, &gKbdSaved, 0, "keyboard backlight byte saved at the last lid close (-1 = none)");
+SYSCTL_INT(_debug, OID_AUTO, wujie_kbd_lid_events, CTLFLAG_RD, &gKbdLidEvents, 0, "lid changes handled for the keyboard backlight");
+static thread_call_t gKbdCall;
+static void kbdLid(thread_call_param_t, thread_call_param_t) {
+    gKbdLidEvents++;
+    if (gLidClosed) {
+        const int v = ecRamRead(kKbdReg);
+        if (v > 0 && (v >> 5)) { gKbdSaved = v; ecRamWrite(kKbdReg, ((unsigned)v & 0x0f) | 0x10); }
+    } else if (gKbdSaved > 0) {
+        const int v = ecRamRead(kKbdReg);
+        if (v >= 0 && !(v >> 5)) ecRamWrite(kKbdReg, ((unsigned)gKbdSaved & 0xef) | 0x10);   // still off: not changed by hand meanwhile
+        gKbdSaved = -1;
+    }
+}
+static IOReturn lidMessage(void *, void *, UInt32 type, IOService *, void *arg, vm_size_t) {
+    if (type == kIOPMMessageClamshellStateChange && gKbdCall) {
+        gLidClosed = ((uintptr_t)arg & kClamshellStateBit) != 0;
+        thread_call_enter(gKbdCall);
+    }
+    return kIOReturnSuccess;
+}
+
 static thread_call_t gEcCall;
 // At the initial power-on too (nullarc PR 20, senqaii-ce): on firmware whose EC has no EmbeddedControl OperationRegion
 // macOS never runs the EC's _REG at all. Here macOS does run it, so this only repeats the same call once the ACPI EC
@@ -149,6 +225,13 @@ bool WujieSleepPolicy::start(IOService *provider) {
     IOLog("WujieSleepPolicy: install -> 0x%x (%s)\n", r, r == kIOReturnSuccess ? "ours" : "another handler was first");
     sysctl_register_oid(&sysctl__debug_wujiesleep_key_writes);
     sysctl_register_oid(&sysctl__debug_wujiesleep_ecreg); sysctl_register_oid(&sysctl__debug_wujiesleep_ecreg_last); sysctl_register_oid(&sysctl__debug_wujiesleep_ecreg_now);
+    sysctl_register_oid(&sysctl__debug_wujie_ec_addr); sysctl_register_oid(&sysctl__debug_wujie_ec_val);
+    char nokbd = 0;
+    if (root && !PE_parse_boot_argn("-wujienokbdlid", &nokbd, sizeof nokbd)) {
+        sysctl_register_oid(&sysctl__debug_wujie_kbd_saved); sysctl_register_oid(&sysctl__debug_wujie_kbd_lid_events);
+        gKbdCall = thread_call_allocate(kbdLid, nullptr);
+        root->registerInterest(gIOGeneralInterest, &lidMessage, this, nullptr);
+    }
     gEcCall = thread_call_allocate(ecRegister, nullptr);
     char flag = 0;
     if (gEcCall && !PE_parse_boot_argn("-wujiesleepnoecreg", &flag, sizeof flag)) {
@@ -169,6 +252,12 @@ IOReturn WujieSleepPolicy::setPowerState(unsigned long ordinal, IOService *) {
     else if (gEcCall && slept) {   // two seconds after power-on: the ACPI EC driver is awake by then
         uint64_t d; clock_interval_to_deadline(2000, kMillisecondScale, &d);
         thread_call_enter_delayed(gEcCall, d);
+        if (gKbdCall && gKbdSaved > 0) {   // a wake with the lid open may bring no lid message: the keyboard light comes back here
+            IOPMrootDomain *root = getPMRootDomain();
+            gLidClosed = root && root->getProperty("AppleClamshellState") == kOSBooleanTrue;
+            clock_interval_to_deadline(4000, kMillisecondScale, &d);
+            thread_call_enter_delayed(gKbdCall, d);
+        }
     }
     return kIOPMAckImplied;
 }

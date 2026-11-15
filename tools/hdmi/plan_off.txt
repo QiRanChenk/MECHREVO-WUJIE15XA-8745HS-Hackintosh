@@ -1,0 +1,7 @@
+# HDMI port off: blank the plane, transmitter B off, OTG1 off, PLL1 off (hdmi-on.sh starts from this state)
+w 3b8f f001b HUBP1_DCHUBP_CNTL
+d 040300013c000180 f600000200005fa0
+s 100
+w 5081 10200 OTG1_OTG_CONTROL
+d 0000000010000280 000000ff010f0015
+s 100
