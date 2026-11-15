@@ -10,6 +10,7 @@
 # (The 780M's clock cap follows the monitor too: the cppcd service raises it while the port is lit.)
 # LaunchDaemon local.hdmid; log /var/log/hdmid.log; `touch /Users/Shared/gpu/hdmi/off` pauses it.
 D=/Users/Shared/gpu/hdmi; cd $D || exit 1
+[ "$(stat -f %z /var/log/hdmid.log 2>/dev/null || echo 0)" -gt 1048576 ] && mv /var/log/hdmid.log /var/log/hdmid.log.old   # at each start
 exec >>/var/log/hdmid.log 2>&1
 say() { echo "$(date '+%F %T') $*"; }
 # a bring-up is running, or the GPU is still in its power-on state after a wake from hibernation (GRBM_STATUS 0)

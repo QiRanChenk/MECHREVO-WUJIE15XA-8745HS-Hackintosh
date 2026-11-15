@@ -69,6 +69,9 @@ final class TCCPrompter {
     var asked = Set<String>()
     var proc: Process?
     func start() {
+        // a previous powerbar that was killed leaves its log stream behind
+        let k = Process(); k.executableURL = URL(fileURLWithPath: "/usr/bin/pkill"); k.arguments = ["-f", "log stream --style compact --predicate process == \"tccd\""]
+        try? k.run(); k.waitUntilExit()
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/log")
         p.arguments = ["stream", "--style", "compact", "--predicate", "process == \"tccd\" AND eventMessage CONTAINS \"Policy disallows prompt\""]
         let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
@@ -351,8 +354,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lidWasClosed = false
         }
         var v: Float = 0
-        if get(d, &v) == 0, v > 0.004 { panelLevel = v }
+        guard get(d, &v) == 0, v > 0.004 else { return }
+        // Across boots: PhxAMDFB starts the panel at full brightness and corebrightnessd keeps it there. The level in use
+        // is kept in the user defaults and put back during the first minutes after a boot (the GPU bring-up re-arms the
+        // panel after login and resets it once more). This was the separate brightkeep agent before.
+        let up = ProcessInfo.processInfo.systemUptime
+        if let saved = bootLevel {
+            if up > 240 { bootLevel = nil }
+            else { if abs(v - saved) > 0.02 { _ = set(d, saved) }; panelLevel = saved; return }
+        }
+        panelLevel = v
+        if abs(v - savedLevel) > 0.005 { savedLevel = v; UserDefaults.standard.set(v, forKey: "panel-level") }
     }
+    var savedLevel: Float = UserDefaults.standard.float(forKey: "panel-level")
+    lazy var bootLevel: Float? = (ProcessInfo.processInfo.systemUptime < 240 && savedLevel > 0.004) ? savedLevel : nil
 
     // ---- language, layout ----
     @objc func toggleLanguage() {

@@ -37,10 +37,9 @@ tools/phxwake/       唤醒后重新初始化核显并恢复显示的常驻服�
 tools/tcc/           关闭 AMFI 后给第三方应用授权摄像头/麦克风的脚本
 tools/gpuclk/        开机给 780M 限频到 800 MHz（省约 25 W），并调用 gpucg
 tools/gpucg/         打开 780M 时钟门控（MGCG/CGCG/CGLS，省约 2 W）
-tools/powerbar/      菜单栏显示充放电功耗、SoC 功耗、温度、预计续航，并可选择 CPU 模式（预设 + 无级滑条）
+tools/powerbar/      菜单栏面板：充放电功耗、SoC 功耗、温度、预计续航；CPU 模式和核显频率上限；外接屏亮度/音量；记住内屏亮度；代替系统询问摄像头/麦克风权限（关闭 AMFI 后系统不弹窗）
 tools/cppc/          CPU 调频服务：开机启用 AMD CPPC，按 powerbar 里选的模式设置能效偏好（需 nullarc PR #21 的 PhxCPPC.kext）
 tools/ryzenstat/     读 MSR / 每核功耗的小工具（需本仓库补丁版 CPU kext）
-tools/brightkeep/    记住屏幕亮度 + 熄屏时关闭背光
 tools/hdmi/          HDMI 外接显示器：点亮 HDMI 口、热插拔、按 EDID 选分辨率、DDC/CI 调显示器亮度（见下文"外接显示器"）
 ```
 

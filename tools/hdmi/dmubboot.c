@@ -7,6 +7,7 @@
 //   dmubboot cmd <w0> <w1> [w2..w7]   one 64-byte inbox command (hex u64 words), waits for the read pointer
 // build: clang -arch x86_64 -O2 -o dmubboot dmubboot.c -framework IOKit -framework CoreFoundation
 #include <IOKit/IOKitLib.h>
+#include <sys/stat.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,12 +23,14 @@
 #define SEL_DBG_WRITE_REG 108
 #define SEL_DBG_VRAM_WRITE 109
 static io_connect_t conn;
-static int logfd = -1;
+static int logfd = -1, logsync;
 
 static void say(const char *fmt, ...) {
    char b[256]; va_list ap; va_start(ap, fmt); int n = vsnprintf(b, sizeof b - 1, fmt, ap); va_end(ap);
    b[n++] = '\n'; fwrite(b, 1, n, stdout); fflush(stdout);
-   if (logfd >= 0) { write(logfd, b, n); fsync(logfd); fcntl(logfd, F_FULLFSYNC); }
+   // DMUBBOOT_SYNC=1: every line reaches the disk before the step it announces runs (for finding the write that resets
+   // the machine); otherwise plain appends, which is what makes lighting a port quick
+   if (logfd >= 0) { write(logfd, b, n); if (logsync) { fsync(logfd); fcntl(logfd, F_FULLFSYNC); } }
 }
 static int open_kext(void) {
    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PhxBringup"));
@@ -371,6 +374,8 @@ static int bars(uint64_t off, int w, int h, int pitch) {
 
 int main(int argc, char **argv) {
    if (argc < 2) { fprintf(stderr, "usage: dmubboot status | start <vbios.bin> | cmd <w0> <w1> ...\n"); return 2; }
+   logsync = getenv("DMUBBOOT_SYNC") != NULL;
+   { struct stat st; if (!stat("/Users/Shared/dmubboot.log", &st) && st.st_size > 2 * 1024 * 1024) rename("/Users/Shared/dmubboot.log", "/Users/Shared/dmubboot.log.old"); }   // keep the last couple of megabytes
    logfd = open("/Users/Shared/dmubboot.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
    if (open_kext()) return 1;
    if (!strcmp(argv[1], "status")) { status(); return 0; }
