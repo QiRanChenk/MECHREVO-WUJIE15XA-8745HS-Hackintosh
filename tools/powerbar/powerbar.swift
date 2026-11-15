@@ -134,48 +134,75 @@ final class TCCPrompter {
 // One sample a minute (time, charge %, Wh left, average watts, on AC) in ~/Library/Application Support/powerbar/
 // history.csv, 60 days kept. From it: sessions (the stretch between two changes of the power source, with the time the
 // machine was actually awake in it), the chart of the last 12 hours, and the usual discharge power for the estimate.
-struct Sample { let t: Double; let pct: Int; let wh: Double; let w: Double; let ext: Bool }
+struct Sample { let t: Double; let pct: Int; let wh: Double; let w: Double; let ext: Bool
+    var brk: Bool = false }      // brk: the machine slept or was off before this sample (no awake time, no line to it)
 struct Session { var start: Double, end: Double; var ext: Bool; var active: Double; var pct0: Int, pct1: Int; var wh0: Double, wh1: Double; var wsum: Double; var n: Int
     var avgW: Double { n > 0 ? wsum / Double(n) : 0 } }
 final class History {
+    static let interval = 300.0        // one sample every five minutes: 288 a day, about 0.5 MB for the 60 days kept
+    static let gap = 750.0             // samples further apart than this count as a break even without the flag
     var samples: [Sample] = []
     let path: String
     var accW = 0.0, accN = 0, lastWrite = 0.0, lastExt: Bool? = nil
+    var pendingBreak = true            // the first sample after a start or a wake carries the break flag
+    var last: (pct: Int, wh: Double?, ext: Bool)? = nil
+    private var typCache: [Bool: (count: Int, value: (watts: Double, minutes: Int)?)] = [:]
+    static func line(_ s: Sample) -> String { "\(Int(s.t)),\(s.pct),\(String(format: "%.2f", s.wh)),\(String(format: "%.2f", s.w)),\(s.ext ? 1 : 0),\(s.brk ? 1 : 0)\n" }
     init() {
         let dir = NSHomeDirectory() + "/Library/Application Support/powerbar"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         path = dir + "/history.csv"
         let cut = Date().timeIntervalSince1970 - 60 * 86400
+        // Read, drop what is older than 60 days, and thin what was written more often than the interval (files from
+        // the one-a-minute version): a sample stays when the power source changes, after a break, or once the interval
+        // has passed since the last one kept; its power is the mean of the ones it stands for.
+        var prevT = 0.0, sumW = 0.0, cnt = 0, lines = 0
         for line in ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "").split(separator: "\n") {
+            lines += 1
             let f = line.split(separator: ",")
-            if f.count >= 5, let t = Double(f[0]), t > cut, let p = Int(f[1]), let wh = Double(f[2]), let w = Double(f[3]) { samples.append(Sample(t: t, pct: p, wh: wh, w: w, ext: f[4] == "1")) }
+            guard f.count >= 5, let t = Double(f[0]), t > cut, t > prevT, let p = Int(f[1]), let wh = Double(f[2]), let w = Double(f[3]) else { continue }
+            let ext = f[4] == "1", brk = (f.count >= 6 && f[5] == "1") || (prevT > 0 && t - prevT > History.gap) || samples.isEmpty
+            prevT = t; sumW += w; cnt += 1
+            if let k = samples.last, !brk, k.ext == ext, t - k.t < History.interval - 10 { continue }
+            samples.append(Sample(t: t, pct: p, wh: wh, w: sumW / Double(cnt), ext: ext, brk: brk)); sumW = 0; cnt = 0
         }
-        // rewrite without the lines that fell out of the window
-        try? samples.map { "\(Int($0.t)),\($0.pct),\(String(format: "%.2f", $0.wh)),\(String(format: "%.2f", $0.w)),\($0.ext ? 1 : 0)" }.joined(separator: "\n").appending(samples.isEmpty ? "" : "\n")
-            .write(toFile: path, atomically: true, encoding: .utf8)
+        // a restart of powerbar itself is no break: the flag only when the last sample is old
+        if let l = samples.last, Date().timeIntervalSince1970 - l.t <= History.gap { pendingBreak = false; lastWrite = l.t; lastExt = l.ext }
+        if lines != samples.count || lines == 0 {
+            try? samples.map { History.line($0) }.joined().write(toFile: path, atomically: true, encoding: .utf8)
+        }
     }
-    // called every tick with the current reading; writes a sample once a minute, and at once when the power source changes
-    func add(pct: Int, wh: Double?, w: Double, ext: Bool) {
-        accW += w; accN += 1
+    // first index with t >= the given time (samples are in time order)
+    func lowerBound(_ t: Double) -> Int {
+        var lo = 0, hi = samples.count
+        while lo < hi { let m = (lo + hi) / 2; if samples[m].t < t { lo = m + 1 } else { hi = m } }
+        return lo
+    }
+    func slice(from: Double, to: Double) -> ArraySlice<Sample> { let a = lowerBound(from); return samples[a..<max(a, lowerBound(to.nextUp))] }
+    // called every tick with the current reading; writes a sample every five minutes, and at once when the power source
+    // changes or when forced (going to sleep)
+    func add(pct: Int, wh: Double?, w: Double, ext: Bool, force: Bool = false) {
+        accW += w; accN += 1; last = (pct, wh, ext)
         let now = Date().timeIntervalSince1970
-        guard now - lastWrite >= 60 || (lastExt != nil && lastExt != ext) else { return }
-        let smp = Sample(t: now, pct: pct, wh: wh ?? 0, w: accW / Double(accN), ext: ext)
-        accW = 0; accN = 0; lastWrite = now; lastExt = ext
+        guard force || pendingBreak || now - lastWrite >= History.interval || (lastExt != nil && lastExt != ext) else { return }
+        if let l = samples.last, now <= l.t { return }
+        let smp = Sample(t: now, pct: pct, wh: wh ?? 0, w: accW / Double(accN), ext: ext, brk: pendingBreak)
+        accW = 0; accN = 0; lastWrite = now; lastExt = ext; pendingBreak = false
         samples.append(smp)
         if let h = FileHandle(forWritingAtPath: path) {
-            h.seekToEndOfFile()
-            h.write("\(Int(smp.t)),\(smp.pct),\(String(format: "%.2f", smp.wh)),\(String(format: "%.2f", smp.w)),\(smp.ext ? 1 : 0)\n".data(using: .utf8)!)
-            h.closeFile()
-        } else { try? "".write(toFile: path, atomically: true, encoding: .utf8) }
+            h.seekToEndOfFile(); h.write(History.line(smp).data(using: .utf8)!); h.closeFile()
+        } else { try? History.line(smp).write(toFile: path, atomically: true, encoding: .utf8) }
     }
+    func willSleep() { if let l = last, accN > 0 { add(pct: l.pct, wh: l.wh, w: accW / Double(accN), ext: l.ext, force: true) } }
+    func didWake() { pendingBreak = true; accW = 0; accN = 0 }
     // a gap of more than five minutes between samples is sleep or power-off: it splits nothing but adds no awake time
     func sessions(from: Double = 0, to: Double = .infinity) -> [Session] {
         var out: [Session] = []
         var prev: Sample? = nil
-        for s in samples where s.t >= from && s.t <= to {
+        for s in slice(from: from, to: to) {
             if out.isEmpty || out[out.count - 1].ext != s.ext {
                 out.append(Session(start: s.t, end: s.t, ext: s.ext, active: 0, pct0: s.pct, pct1: s.pct, wh0: s.wh, wh1: s.wh, wsum: 0, n: 0))
-            } else if let p = prev, s.t - p.t <= 300 { out[out.count - 1].active += s.t - p.t }
+            } else if let p = prev, !s.brk, s.t - p.t <= History.gap { out[out.count - 1].active += s.t - p.t }
             out[out.count - 1].end = s.t; out[out.count - 1].pct1 = s.pct; out[out.count - 1].wh1 = s.wh
             if abs(s.w) < 150 { out[out.count - 1].wsum += s.w; out[out.count - 1].n += 1 }
             prev = s
@@ -184,14 +211,18 @@ final class History {
     }
     // The usual power on battery (positive watts) or while charging, over the last 14 days: samples between the 10th and
     // the 90th percentile only, so a stuck gauge, a sample taken across a wake or a short burst do not move it.
+    // Worked out again only when a sample was added. Needs half an hour of samples (six).
     func typicalWatts(charging: Bool) -> (watts: Double, minutes: Int)? {
-        let cut = Date().timeIntervalSince1970 - 14 * 86400
-        var v = samples.filter { $0.t > cut && $0.ext == charging && abs($0.w) < 150 && (charging ? $0.w > 1 : $0.w < -1) }.map { abs($0.w) }
-        guard v.count >= 30 else { return nil }
-        v.sort()
-        let lo = v.count / 10, hi = v.count - v.count / 10
-        let mid = v[lo..<hi]
-        return (mid.reduce(0, +) / Double(mid.count), v.count)
+        if let c = typCache[charging], c.count == samples.count { return c.value }
+        var v = samples[lowerBound(Date().timeIntervalSince1970 - 14 * 86400)...].filter { $0.ext == charging && abs($0.w) < 150 && (charging ? $0.w > 1 : $0.w < -1) }.map { abs($0.w) }
+        var out: (watts: Double, minutes: Int)? = nil
+        if v.count >= 6 {
+            v.sort()
+            let mid = v[(v.count / 10)..<(v.count - v.count / 10)]
+            out = (mid.reduce(0, +) / Double(mid.count), v.count * Int(History.interval / 60))
+        }
+        typCache[charging] = (samples.count, out)
+        return out
     }
 }
 // battery charge over the last 12 hours: green while on AC, the text colour on battery; breaks where the machine slept
@@ -205,8 +236,10 @@ final class HistoryChart: NSView {
         let now = Date().timeIntervalSince1970, span = 12.0 * 3600
         func pt(_ s: Sample) -> NSPoint { NSPoint(x: r.maxX - CGFloat((now - s.t) / span) * r.width, y: r.minY + CGFloat(s.pct) / 100 * r.height) }
         var prev: Sample? = nil
-        for s in samples where now - s.t <= span {
-            if let p = prev, s.t - p.t <= 300 {
+        var lo = 0, hi = samples.count
+        while lo < hi { let m = (lo + hi) / 2; if samples[m].t < now - span { lo = m + 1 } else { hi = m } }
+        for s in samples[lo...] {
+            if let p = prev, !s.brk, s.t - p.t <= History.gap {
                 (s.ext ? NSColor.systemGreen : NSColor.labelColor).setStroke()
                 let path = NSBezierPath(); path.move(to: pt(p)); path.line(to: pt(s)); path.lineWidth = 1.6; path.lineCapStyle = .round; path.stroke()
             }
@@ -231,8 +264,9 @@ final class RangeChart: NSView {
     func visible() -> ArraySlice<Sample> {
         var lo = 0, hi = samples.count
         while lo < hi { let m = (lo + hi) / 2; if samples[m].t < t0 { lo = m + 1 } else { hi = m } }
-        var e = lo; while e < samples.count && samples[e].t <= t1 { e += 1 }
-        return samples[lo..<e]
+        let a = lo; hi = samples.count
+        while lo < hi { let m = (lo + hi) / 2; if samples[m].t <= t1 { lo = m + 1 } else { hi = m } }
+        return samples[a..<lo]
     }
     override func updateTrackingAreas() {
         if let a = area { removeTrackingArea(a) }
@@ -275,28 +309,32 @@ final class RangeChart: NSView {
         }
         // the curves; points closer than 0.7 px to the last drawn one are skipped (60 days = 86 000 samples)
         func py(_ s: Sample) -> CGFloat { pr.minY + CGFloat(s.pct) / 100 * pr.height }
+        // (everything of one colour goes into one path: two strokes and two fills for the whole chart)
+        let lines = [NSBezierPath(), NSBezierPath()], bars = [NSBezierPath(), NSBezierPath()], gaps = NSBezierPath()
         var anchor: Sample? = nil, prev: Sample? = nil
         for s in vis {
-            if let p = prev, s.t - p.t > 300 {
-                NSColor.labelColor.withAlphaComponent(0.05).setFill()
-                NSRect(x: x(p.t), y: pr.minY, width: x(s.t) - x(p.t), height: pr.height).fill()
+            if let p = prev, s.brk || s.t - p.t > History.gap {
+                gaps.appendRect(NSRect(x: x(p.t), y: pr.minY, width: x(s.t) - x(p.t), height: pr.height))
                 anchor = nil
             }
             if let a = anchor {
-                if x(s.t) - x(a.t) >= 0.7 || s.ext != a.ext {
-                    let c = s.ext ? NSColor.systemGreen : NSColor.labelColor
-                    c.setStroke()
-                    let path = NSBezierPath(); path.move(to: NSPoint(x: x(a.t), y: py(a))); path.line(to: NSPoint(x: x(s.t), y: py(s)))
-                    path.lineWidth = 1.6; path.lineCapStyle = .round; path.stroke()
+                let xa = x(a.t), xs = x(s.t)
+                if xs - xa >= 0.7 || s.ext != a.ext {
+                    let k = s.ext ? 1 : 0
+                    lines[k].move(to: NSPoint(x: xa, y: py(a))); lines[k].line(to: NSPoint(x: xs, y: py(s)))
                     if abs(s.w) < 150 {
-                        c.withAlphaComponent(0.55).setFill()
                         let h = CGFloat(s.w / wmax) * wr.height / 2
-                        NSRect(x: x(a.t), y: min(wy, wy + h), width: max(1, x(s.t) - x(a.t)), height: abs(h)).fill()
+                        bars[k].appendRect(NSRect(x: xa, y: min(wy, wy + h), width: max(1, xs - xa), height: abs(h)))
                     }
                     anchor = s
                 }
             } else { anchor = s }
             prev = s
+        }
+        NSColor.labelColor.withAlphaComponent(0.05).setFill(); gaps.fill()
+        for (k, c) in [NSColor.labelColor, NSColor.systemGreen].enumerated() {
+            c.withAlphaComponent(0.55).setFill(); bars[k].fill()
+            c.setStroke(); lines[k].lineWidth = 1.6; lines[k].lineCapStyle = .round; lines[k].lineJoinStyle = .round; lines[k].stroke()
         }
         if vis.isEmpty { text(L("这段时间没有记录", "No records in this range"), at: NSPoint(x: pr.midX, y: pr.midY), center: true) }
         // the sample under the pointer
@@ -306,7 +344,7 @@ final class RangeChart: NSView {
         var lo = vis.startIndex, hi = vis.endIndex
         while lo < hi { let m = (lo + hi) / 2; if samples[m].t < ht { lo = m + 1 } else { hi = m } }
         for i in [lo - 1, lo] where i >= vis.startIndex && i < vis.endIndex { if abs(samples[i].t - ht) < abs(best.t - ht) { best = samples[i] } }
-        guard abs(best.t - ht) <= max(300, span / Double(plot.width) * 6) else { onHover?(""); return }
+        guard abs(best.t - ht) <= max(History.interval, span / Double(plot.width) * 6) else { onHover?(""); return }
         let bx = x(best.t)
         NSColor.labelColor.withAlphaComponent(0.35).setStroke()
         let p = NSBezierPath(); p.move(to: NSPoint(x: bx, y: wr.minY)); p.line(to: NSPoint(x: bx, y: pr.maxY)); p.lineWidth = 1; p.stroke()
@@ -434,7 +472,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func rangePicked() { recordsCount = -1; refreshRecords() }
     @objc func rangeTyped() { rangeSeg.selectedSegment = 6; recordsCount = -1; refreshRecords() }
     func refreshRecords() {
-        guard let w = recordsWindow else { return }
+        // called every tick while the window is open: work only when a sample was added or the range was changed
+        guard let w = recordsWindow, recordsCount != history.samples.count else { return }
+        recordsCount = history.samples.count
         w.title = L("充放电记录", "Charge and discharge records")
         let names = [L("6 小时", "6 h"), L("24 小时", "24 h"), L("3 天", "3 d"), L("7 天", "7 d"), L("30 天", "30 d"), L("全部", "All"), L("自选", "Custom")]
         for (i, n) in names.enumerated() { rangeSeg.setLabel(n, forSegment: i) }
@@ -445,8 +485,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         else { t0 = fromPicker.dateValue.timeIntervalSince1970; t1 = toPicker.dateValue.timeIntervalSince1970; if t1 < t0 + 600 { t1 = t0 + 600 } }
         if i != 6 { fromPicker.dateValue = Date(timeIntervalSince1970: t0); toPicker.dateValue = Date(timeIntervalSince1970: t1) }
         rangeChart.samples = history.samples; rangeChart.t0 = t0; rangeChart.t1 = t1; rangeChart.needsDisplay = true
-        guard recordsCount != history.samples.count else { return }      // the texts only when there is something new
-        recordsCount = history.samples.count
         let ses = history.sessions(from: t0, to: t1)
         var batt = 0.0, ac = 0.0, bw = 0.0, bn = 0, cw = 0.0, cn = 0
         for s in ses { if s.ext { ac += s.active; cw += s.wsum; cn += s.n } else { batt += s.active; bw += s.wsum; bn += s.n } }
@@ -730,6 +768,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.button?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         tick(); resize()
         tcc.start()
+        // a sample on the way into sleep, and the next one after the wake marked as following a break
+        let wsn = NSWorkspace.shared.notificationCenter
+        wsn.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in self?.history.willSleep() }
+        wsn.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in self?.history.didWake() }
         // .common: the panel keeps updating while the menu is open
         let t = Timer(timeInterval: 2, repeats: true) { _ in self.tick() }
         RunLoop.main.add(t, forMode: .common)
@@ -812,7 +854,8 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot" {
 if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot-records" {
     app.appearance = NSAppearance(named: CommandLine.arguments.count > 3 && CommandLine.arguments[3] == "dark" ? .darkAqua : .aqua)
     var smp: [Sample] = []; let now = Date().timeIntervalSince1970; var pct = 80.0
-    for i in stride(from: 4320, to: 0, by: -1) {
+    let days = CommandLine.arguments.count > 5 ? Int(CommandLine.arguments[5]) ?? 3 : 3
+    for i in stride(from: days * 1440, to: 0, by: -5) {
         let c = i % 700
         if c > 300 { pct = max(5, pct - 0.2) } else if c > 220 { continue } else { pct = min(100, pct + 0.5) }
         let ac = c <= 220
@@ -826,6 +869,10 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot-rec
     let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
     v.cacheDisplay(in: v.bounds, to: rep)
     try? rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
+    var t = Date(); for _ in 0..<20 { delegate.recordsCount = -1; delegate.refreshRecords() }
+    let tq = Date().timeIntervalSince(t) / 20; t = Date()
+    for _ in 0..<20 { delegate.rangeChart.cacheDisplay(in: delegate.rangeChart.bounds, to: rep) }
+    print(String(format: "%d samples: summary and sessions %.2f ms, chart redraw %.2f ms", smp.count, tq * 1000, Date().timeIntervalSince(t) / 20 * 1000))
     exit(0)
 }
 app.delegate = delegate
