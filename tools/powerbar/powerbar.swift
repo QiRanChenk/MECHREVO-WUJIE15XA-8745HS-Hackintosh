@@ -78,7 +78,15 @@ final class TCCPrompter {
         let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
         var rest = ""
         pipe.fileHandleForReading.readabilityHandler = { h in
-            guard let chunk = String(data: h.availableData, encoding: .utf8), !chunk.isEmpty else { return }
+            let data = h.availableData
+            // No data = the stream ended (another powerbar's start killed it, or log quit). The handler must go, or it is
+            // called again at once for ever: a whole core, 7-17 W at the chip (2026-11-17, twice). A new stream in 10 s.
+            if data.isEmpty {
+                h.readabilityHandler = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in self?.start() }
+                return
+            }
+            guard let chunk = String(data: data, encoding: .utf8), !chunk.isEmpty else { return }
             rest += chunk
             while let nl = rest.firstIndex(of: "\n") { let line = String(rest[..<nl]); rest = String(rest[rest.index(after: nl)...]); self.handle(line) }
         }
@@ -183,8 +191,16 @@ final class History {
     // called every tick with the current reading; writes a sample every five minutes, and at once when the power source
     // changes or when forced (going to sleep)
     func add(pct: Int, wh: Double?, w: Double, ext: Bool, force: Bool = false) {
-        accW += w; accN += 1; last = (pct, wh, ext)
         let now = Date().timeIntervalSince1970
+        // The power source changed: what was gathered so far belongs to the old one. It is written under the old source
+        // (it used to go out under the new one, so a battery stretch began with a +34 W charging sample and its average
+        // came out several watts low), and the new stretch starts with this reading.
+        if let le = lastExt, le != ext, accN > 0, let l = last, !pendingBreak, samples.last.map({ now - 1 > $0.t }) ?? true {
+            let old = Sample(t: now - 1, pct: l.pct, wh: l.wh ?? 0, w: accW / Double(accN), ext: le, brk: false)
+            samples.append(old); accW = 0; accN = 0
+            if let h = FileHandle(forWritingAtPath: path) { h.seekToEndOfFile(); h.write(History.line(old).data(using: .utf8)!); h.closeFile() }
+        }
+        accW += w; accN += 1; last = (pct, wh, ext)
         guard force || pendingBreak || now - lastWrite >= History.interval || (lastExt != nil && lastExt != ext) else { return }
         if let l = samples.last, now <= l.t { return }
         let smp = Sample(t: now, pct: pct, wh: wh ?? 0, w: accW / Double(accN), ext: ext, brk: pendingBreak)
@@ -205,7 +221,8 @@ final class History {
                 out.append(Session(start: s.t, end: s.t, ext: s.ext, active: 0, pct0: s.pct, pct1: s.pct, wh0: s.wh, wh1: s.wh, wsum: 0, n: 0))
             } else if let p = prev, !s.brk, s.t - p.t <= History.gap { out[out.count - 1].active += s.t - p.t }
             out[out.count - 1].end = s.t; out[out.count - 1].pct1 = s.pct; out[out.count - 1].wh1 = s.wh
-            if abs(s.w) < 150 { out[out.count - 1].wsum += s.w; out[out.count - 1].n += 1 }
+            // a sample whose sign contradicts its source (written at a switch by the versions before the fix) is no part of the average
+            if abs(s.w) < 150, s.ext ? s.w > -0.5 : s.w < 0.5 { out[out.count - 1].wsum += s.w; out[out.count - 1].n += 1 }
             prev = s
         }
         return out
@@ -586,6 +603,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let gpuSlider = NSSlider(value: 800, minValue: 800, maxValue: 2600, target: nil, action: nil)
     let gpuValue = label(size: 12, weight: .medium, mono: true)
     let gpuLine = label(size: 11, color: .secondaryLabelColor)
+    let gpuNow = label(size: 12, mono: true)       // the clock and load the GPU driver's power loop reports (debug.phx_pm_*)
+    // display power saving: the root service dcnpm gives the panel's pipe Linux's values and lets DRAM self-refresh
+    // (switch /Users/Shared/cppc/dcnpm "on"|"off", state in dcnpm-status "<on|off|fault|wait> <selfrefresh> <external>")
+    let dcnSwitch = NSSwitch()
+    let dcnLabel = label(size: 12)
+    let dcnLine = label(size: 11, color: .secondaryLabelColor)
     var gpuWrite: Timer? = nil
     var gpuSetAt = Date.distantPast
 
@@ -647,7 +670,34 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let t = Timer(timeInterval: 0.3, repeats: false) { _ in self.writeLine(self.modeDir + "/gpu", "\(v)") }
         RunLoop.main.add(t, forMode: .common); gpuWrite = t
     }
+    func sysctlInt(_ name: String) -> Int? {
+        var v: Int32 = 0; var n = MemoryLayout<Int32>.size
+        return sysctlbyname(name, &v, &n, nil, 0) == 0 ? Int(v) : nil
+    }
+    @objc func toggleDcn(_ s: NSSwitch) { writeLine(modeDir + "/dcnpm", s.state == .on ? "on" : "off"); dcnSetAt = Date(); refreshDcn() }
+    var dcnSetAt = Date.distantPast
+    func refreshDcn() {
+        let want = readLine(modeDir + "/dcnpm") != "off"
+        if Date().timeIntervalSince(dcnSetAt) > 3 { dcnSwitch.state = want ? .on : .off }
+        let st = readLine(modeDir + "/dcnpm-status").split(separator: " ").map(String.init)
+        // no status file = the dcnpm service is not installed on this machine: no rows for it
+        let have = st.count >= 3
+        dcnLabel.superview?.isHidden = !have; dcnLine.isHidden = !have
+        guard have else { return }
+        switch st[0] {
+        case "on": dcnLine.stringValue = st[1] == "1" ? L("已生效 · 内存可自刷新", "On · memory may self-refresh")
+                                                      : L("已生效 · 外接屏亮着，内存自刷新暂停", "On · self-refresh paused while an external display runs")
+        case "off": dcnLine.stringValue = L("已关闭（开机默认设置）", "Off (firmware settings)")
+        case "fault": dcnLine.stringValue = L("检测到显示欠载，已恢复默认，重启前不再尝试", "Display underflow: back to defaults until the next boot")
+        default: dcnLine.stringValue = L("等待显卡驱动就绪…", "Waiting for the GPU driver…")
+        }
+    }
     func refreshGpu() {
+        refreshDcn()
+        if let clk = sysctlInt("debug.phx_pm_gfxclk") {
+            let busy = sysctlInt("debug.phx_pm_busy_avg") ?? 0
+            gpuNow.stringValue = clk > 0 ? L("当前频率 \(clk) MHz · 负载 \(busy)%", "Clock now \(clk) MHz · load \(busy)%") : L("当前频率：已关核（空闲）", "Clock now: off (idle)")
+        } else { gpuNow.stringValue = L("当前频率：读不到", "Clock now: no data") }
         let want = readLine(modeDir + "/gpu")
         let auto = Int(want) == nil
         let st = readLine(modeDir + "/gpu-status").split(separator: " ").map(String.init)
@@ -759,6 +809,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshExt()
         for (i, p) in presets.enumerated() { modeSeg.setLabel(L(p.zh, p.en), forSegment: i) }
         sliderLeft.stringValue = L("性能", "Performance"); sliderRight.stringValue = L("省电", "Saver")
+        dcnLabel.stringValue = L("显示省电", "Display power saving")
         gpuAutoLabel.stringValue = L("自动（单屏 800 · 外接屏 1600 MHz）", "Automatic (800 MHz alone, 1600 with a display)")
         lidLabel.stringValue = L("合盖不休眠（继续运行）", "Keep running with the lid closed")
         langButton.title = english ? "中文" : "English"
@@ -794,7 +845,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         gpuSlider.target = self; gpuSlider.action = #selector(gpuSlid(_:)); gpuSlider.isContinuous = true; gpuSlider.controlSize = .small
         gpuSlider.numberOfTickMarks = 19; gpuSlider.allowsTickMarkValuesOnly = true
         gpuValue.alignment = .right; gpuValue.widthAnchor.constraint(equalToConstant: 72).isActive = true
-        let gfx = Card([hstack([gpuAutoLabel, spacer(), gpuAuto]), hstack([symbol("speedometer"), gpuSlider, gpuValue]), gpuLine])
+        dcnSwitch.controlSize = .mini; dcnSwitch.target = self; dcnSwitch.action = #selector(toggleDcn(_:))
+        let gfx = Card([gpuNow, hstack([gpuAutoLabel, spacer(), gpuAuto]), hstack([symbol("speedometer"), gpuSlider, gpuValue]), gpuLine,
+                        hstack([dcnLabel, spacer(), dcnSwitch]), dcnLine])
+        gfx.stack.setCustomSpacing(4, after: dcnLabel.superview ?? dcnLabel)
         // external display card
         // options card
         lidSwitch.controlSize = .mini; lidSwitch.target = self; lidSwitch.action = #selector(toggleLid(_:))
@@ -858,7 +912,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             refreshHistory(whLeft: b.whLeft, whFull: b.whFull, external: b.external)
         } else { bigWatts.stringValue = "—"; battState.stringValue = L("读不到电池", "No battery data"); timeLine.stringValue = "" }
         if let c = cpu.read() {
-            cpuAvg = cpuAvg.map { $0 * 0.6 + c.watts * 0.4 } ?? c.watts
+            // The chip's power as its power-management firmware measures it (debug.phx_pm_socket_mw_avg) when the GPU
+            // driver publishes it. The package-energy counter (c.watts) reads about 2.4 W low while the display lets the
+            // memory self-refresh (dcnpm on), with no change at the battery or in the firmware's reading (2026-11-17).
+            let pw = sysctlInt("debug.phx_pm_socket_mw_avg").flatMap { $0 > 0 ? Double($0) / 1000 : nil } ?? c.watts
+            cpuAvg = cpuAvg.map { $0 * 0.6 + pw * 0.4 } ?? pw
             cpuLine.stringValue = String(format: L("CPU + 核显 %.1f W · %.0f°C", "CPU + GPU %.1f W · %.0f°C"), cpuAvg!, c.temp)
         } else { cpuLine.stringValue = L("读不到 CPU 功耗", "No CPU power data") }
         item.button?.title = title
@@ -889,6 +947,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 }
 let app = NSApplication.shared
 let delegate = App()
+// Any other argument is a mistake (--help, a typo): a second menu-bar instance would start and kill the first one's
+// log stream.
+if CommandLine.arguments.count >= 2, !["--snapshot", "--snapshot-records"].contains(CommandLine.arguments[1]) {
+    print("usage: powerbar                                  the menu-bar app (started by the login agent)\n       powerbar --snapshot <file.png> [dark]\n       powerbar --snapshot-records <file.png> [dark] [segment]")
+    exit(2)
+}
 // powerbar --snapshot <file.png> [dark]: draw the panel once into a picture (for looking at the layout), with sample
 // values where this machine has none
 if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot" {
@@ -902,6 +966,7 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot" {
     if delegate.modeLine.stringValue.count > 12 { delegate.modeLine.stringValue = "EPP 128 · " + L("自动", "auto") + " · " + L("插电", "AC"); delegate.modeSeg.selectedSegment = 0 }
     delegate.gpuValue.stringValue = "1600 MHz"; delegate.gpuSlider.doubleValue = 1600; delegate.gpuAuto.state = .on
     delegate.gpuLine.stringValue = L("当前上限 1600 MHz · 越高越流畅，也越耗电", "Cap now 1600 MHz · higher is smoother and draws more")
+    if delegate.sysctlInt("debug.phx_pm_gfxclk") == nil { delegate.gpuNow.stringValue = L("当前频率 1600 MHz · 负载 12%", "Clock now 1600 MHz · load 12%") }
     if delegate.history.samples.count < 30 {      // a made-up day for the picture
         var smp: [Sample] = []; let now = Date().timeIntervalSince1970; var pct = 96.0
         for i in stride(from: 700, to: 0, by: -1) {
